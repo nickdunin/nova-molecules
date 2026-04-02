@@ -1,9 +1,12 @@
-#!/usr/bin/env python3
 """
-NICK Blueprint Miner v2 — SAVI SQLite + rxn: format
-=====================================================
-Output MUST use rxn:* reaction-formatted molecules from the SAVI
-combinatorial SQLite DB. Raw SMILES are REJECTED by the validator.
+NICK Blueprint Miner v3 - SN68 Nova Optimized
+============================================================
+Key fixes vs v2:
+1. RESTRICT to rxn:1 + rxn:2 ONLY (validator hardcoded constraint)
+2. BEST molecule FIRST in output (num_molecules_boltz:1, sample_selection:first)
+3. Heavy-atom-aware scoring (smaller + high-affinity = better Boltz score)
+4. DAT seed similarity heuristic when PSICHIC unavailable
+5. All neighbour exploration stays within rxn:1/rxn:2 only
 """
 import json, os, sys, time, random, math, sqlite3
 from pathlib import Path
@@ -12,6 +15,18 @@ INPUT_FILE  = '/workspace/input.json'
 OUTPUT_FILE = '/output/result.json'
 os.makedirs('/tmp/nick_bp', exist_ok=True)
 os.makedirs('/output', exist_ok=True)
+
+# Known DAT binders from validator reinvent_seeds (methylphenidate analogues for P23977)
+DAT_SEEDS = [
+    'COC(=O)C1(c2cccc2)CC[NH+](C)CC1',
+    'Fc1ccc(C2C[NH+](CCc3ccccc3)CC2)cc1',
+    'COc1ccc(C2CCNCC2)cc1OC',
+    'O=C(NCCN1CCCC1)c1ccc(Cl)cc1',
+    'c1ccc2c(c1)C(CN1CCCC1)CC2',
+]
+
+# Validator validity.py HARDCODES only these two templates as allowed
+ALLOWED_TEMPLATES = {1, 2}
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -30,10 +45,10 @@ def extract_params(data):
         target = target.get('sequence') or target.get('id') or 'P23977'
     ats = data.get('antitargets', data.get('antitarget', []))
     if isinstance(ats, str): ats = [ats]
-    aw = float(data.get('antitarget_weight', 0.9))
-    tl = int(data.get('time_limit', data.get('time_budget', 1800)))
-    nm = int(data.get('num_molecules', 100))
-    db = (data.get('db_path') or data.get('database') or data.get('savi_db'))
+    aw  = float(data.get('antitarget_weight', 0.9))
+    tl  = int(data.get('time_limit', data.get('time_budget', 1800)))
+    nm  = int(data.get('num_molecules', 30))
+    db  = (data.get('db_path') or data.get('database') or data.get('savi_db'))
     if not db:
         for pat in ['*.db', '*.sqlite', '*.sqlite3']:
             hits = list(Path('/workspace').glob(pat))
@@ -43,13 +58,13 @@ def extract_params(data):
 
 KNOWN_SEQS = {
     'P23977': (
-        'MASKKMNESRNFIQPRTFGSMPKTLSSSKSPRDEQVHKKKSKEAKGPSGTHIQHNTRSITEEQPTNSVMHILQ'
+        'MASKKMNESNFIQPRTFGSMPKTLSSSKSPRDEQVHKKKSKEAKGPSGTHIQHNTRSITEEQPTNSVMHILQ'
         'NLSRLNEPQKTQVPQHLPKHNTKNHKLLILKIFIPMMILSLSVNLFPLFISFSYFFLLIKFITSPFLHQTLYF'
-        'VLFGLSSFLVAVLSAVVLLAQDYQVSNISNLIPQLNELYESAAIPPPKPDLTPKNQATPRGCLESFLKLFFNL'
+        'VLFGLSSFLVAVLSAVVLLAQDYQVSNISNLIQLQNELYESAAIPPKPDLTPKNQATPRGCLESFLKLFFNL'
         'FGMIPYMILICFLQLGLFVHFGLMSAQTLNSSPAFKQAIQETYQFSRTLQYVLSELLKSIIVVVLATIIFGFL'
         'NLAAYLMGQLQNMDMHPSEGPRNLKRLNPPAVSHEPIQSQKMKESTDDTEGGISRISGSGKLMSRPNEAGNAE'
-        'DDEATRLILKLREIQEYLIEQHGALISLGFVVNILQPIMVFAGMTSHGRYQDIMGLPFPKAFEIPYQSLRLGK'
-        'VDAKMISTVQGILLKQLMAVSACLAGLASLFAIAMDTLVNASEFNLDTLNFYIIMQVLSANVTFMIVSKFWDN'
+        'DDEATRLILKLREIQEYIIEQHGALISLGFVVNILQPIMVFAGMTSHGRYQDIMGLPFPKAFEIPYQSLRLGK'
+        'VDAKMISTVQGILLKQLMAVSACLAGLASLFAIANDTLVNASEFNLDTLNFYIIMQVLSANVTFMIVSKFWDN'
         'FTLHSLYYLIGCYLSGYVTATPTLNIPIFVYLAFKAGPKLRMMFTEESYALGSSCSNLQCYIGQQPKKLHDQL'
         'SCGKEGFAEQLIAMTQFMQDYTPETTNHMSSSDLTAAQLHVFNAKAIEMKHQ'),
 }
@@ -85,11 +100,35 @@ class SAVIDatabase:
                                 self.smiles_col = c
                 if self.mol_table:
                     self.n_mols = self.conn.execute(f"SELECT COUNT(*) FROM {self.mol_table}").fetchone()[0]
-                    log(f"Mol table:{self.mol_table}({self.n_mols:,}) rxn_col:{self.rxn_col} smi_col:{self.smiles_col}")
+                    log(f"Mol table:{self.mol_table}({self.n_mols:,}) rxn:{self.rxn_col} smi:{self.smiles_col}")
             except Exception as e:
                 log(f"DB error: {e}")
 
     def ok(self): return self.conn is not None and self.mol_table is not None
+
+    def sample_rxn12(self, n=500):
+        """Sample ONLY from rxn:1 and rxn:2 — the only templates validator allows."""
+        if not self.ok(): return []
+        result = []
+        cols = self.rxn_col
+        if self.smiles_col: cols += ', ' + self.smiles_col
+        try:
+            half = max(n // 2, 1)
+            for tmpl_num in [1, 2]:
+                like_pat = f"rxn:{tmpl_num}:%"
+                rows = self.conn.execute(
+                    f"SELECT {cols} FROM {self.mol_table} "
+                    f"WHERE {self.rxn_col} LIKE ? ORDER BY RANDOM() LIMIT ?",
+                    (like_pat, half)).fetchall()
+                for r in rows:
+                    rxn = str(r[0])
+                    if not rxn.startswith('rxn:'): rxn = 'rxn:' + rxn
+                    smi = str(r[1]) if self.smiles_col and len(r) > 1 else None
+                    result.append((rxn, smi))
+            random.shuffle(result)
+            return result
+        except Exception as e:
+            log(f"sample_rxn12 err:{e}"); return self.sample(n)
 
     def sample(self, n=500):
         if not self.ok(): return []
@@ -113,41 +152,55 @@ class SAVIDatabase:
         lid = rxn_id[4:] if rxn_id.startswith('rxn:') else rxn_id
         for qid in [lid, rxn_id]:
             try:
-                r = self.conn.execute(f"SELECT {self.smiles_col} FROM {self.mol_table} WHERE {self.rxn_col}=?", (qid,)).fetchone()
+                r = self.conn.execute(
+                    f"SELECT {self.smiles_col} FROM {self.mol_table} WHERE {self.rxn_col}=?",
+                    (qid,)).fetchone()
                 if r: return str(r[0])
             except: pass
         return None
 
-    def neighbours(self, rxn_id, n=5):
+    def neighbours_rxn12(self, rxn_id, n=5):
+        """Get neighbours but STAY within rxn:1 and rxn:2 only."""
         parts = rxn_id.replace('rxn:','').split(':')
         result = []
         if len(parts) >= 2:
             tmpl, r1 = parts[0], parts[1]
             try:
+                if int(tmpl) not in ALLOWED_TEMPLATES:
+                    # Redirect to allowed template
+                    tmpl = str(random.choice([1, 2]))
+            except: tmpl = str(random.choice([1, 2]))
+            try:
                 base = int(r1)
-                for off in random.sample(range(-100,101), min(n*3,201)):
+                offsets = random.sample(range(-100, 101), min(n*3, 201))
+                for off in offsets:
                     nr = base + off
                     if nr >= 0:
                         tail = ':'.join([tmpl, str(nr)] + parts[2:])
                         result.append('rxn:' + tail)
-                        if len(result) >= n: break
+                    if len(result) >= n: break
             except: pass
-            if self.ok():
-                try:
-                    rows = self.conn.execute(
-                        f"SELECT {self.rxn_col} FROM {self.mol_table} WHERE {self.rxn_col} LIKE ? LIMIT ?",
-                        (f"{tmpl}:%", n)).fetchall()
-                    for row in rows:
-                        rx = str(row[0])
-                        if not rx.startswith('rxn:'): rx = 'rxn:'+rx
-                        if rx != rxn_id: result.append(rx)
-                except: pass
+        # Also do DB lookup for same template
+        if self.ok() and parts:
+            try:
+                tmpl_prefix = f"rxn:{parts[0]}:%"
+                rows = self.conn.execute(
+                    f"SELECT {self.rxn_col} FROM {self.mol_table} "
+                    f"WHERE {self.rxn_col} LIKE ? ORDER BY RANDOM() LIMIT ?",
+                    (tmpl_prefix, n)).fetchall()
+                for row in rows:
+                    rx = str(row[0])
+                    if not rx.startswith('rxn:'): rx = 'rxn:'+rx
+                    if rx != rxn_id: result.append(rx)
+            except: pass
         return result[:n]
 
     def close(self):
         if self.conn: self.conn.close()
 
+
 class Scorer:
+    """PSICHIC-based scorer with graceful fallback."""
     def __init__(self):
         self.pw = None
         for p in ['/root/nova','/nova','/app','/workspace','.','/root']:
@@ -159,14 +212,15 @@ class Scorer:
             from PSICHIC.wrapper import PsichicWrapper
             self.pw = PsichicWrapper()
             log("PSICHIC loaded")
-        except Exception as e: log(f"PSICHIC: {e}")
+        except Exception as e: log(f"PSICHIC unavailable: {e}")
 
     def score(self, target_seq, antitargets, smiles_list, aw=0.9):
         if not self.pw or not smiles_list: return {}
         try:
             self.pw.run_challenge_start(target_seq)
             df = self.pw.run_validation(smiles_list)
-            ts = {str(r['Ligand']): float(r.get('predicted_binding_affinity',0)) for _,r in df.iterrows()}
+            ts = {str(r['Ligand']): float(r.get('predicted_binding_affinity',0))
+                  for _,r in df.iterrows()}
         except Exception as e: log(f"target score err:{e}"); ts = {}
         at = {s:0.0 for s in smiles_list}
         for seq in antitargets:
@@ -179,6 +233,39 @@ class Scorer:
                     at[s]=max(at.get(s,0),v)
             except Exception as e: log(f"at score:{e}")
         return {s: ts.get(s,0)-aw*at.get(s,0) for s in smiles_list}
+
+
+def seed_similarity_score(smi, seed_fps=None):
+    """
+    Heuristic when PSICHIC unavailable:
+    Tanimoto similarity to known DAT binders + small-HA bonus.
+    Rationale: heavy_atom_normalization rewards smaller molecules;
+    DAT_SEEDS represent known good chemical space for P23977.
+    """
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import rdMolDescriptors, DataStructs
+        m = Chem.MolFromSmiles(smi)
+        if not m: return 0.0
+        ha = m.GetNumHeavyAtoms()
+        if ha < 10 or ha > 40: return 0.0
+
+        fp = rdMolDescriptors.GetMACCSKeysFingerprint(m)
+        if seed_fps is None:
+            seed_fps = []
+            for s in DAT_SEEDS:
+                sm = Chem.MolFromSmiles(s)
+                if sm: seed_fps.append(rdMolDescriptors.GetMACCSKeysFingerprint(sm))
+        if not seed_fps: return 0.5
+
+        sims = DataStructs.BulkTanimotoSimilarity(fp, seed_fps)
+        max_sim = max(sims) if sims else 0.0
+        # Heavier molecules penalised (mimics heavy_atom_normalization)
+        ha_factor = 20.0 / max(ha, 10)
+        return max_sim * ha_factor
+    except Exception as e:
+        log(f"seed_sim err:{e}"); return 0.0
+
 
 class ComponentRanker:
     def __init__(self, alpha=0.3):
@@ -194,8 +281,9 @@ class ComponentRanker:
         return sum(scores)/len(scores) if scores else 0.0
     def top_tmpls(self, n=5): return sorted(self.tmpl.items(), key=lambda x:-x[1])[:n]
 
+
 def div_select(scored_triples, n=100):
-    # scored_triples: [(rxn_id, score, smiles_or_None)]
+    """Diversity-filtered selection by MACCS Tanimoto. Returns rxn_ids."""
     try:
         from rdkit import Chem
         from rdkit.Chem import rdMolDescriptors, DataStructs
@@ -203,7 +291,7 @@ def div_select(scored_triples, n=100):
         for rxn,sc,smi in scored_triples:
             m = Chem.MolFromSmiles(smi) if smi else None
             if m: valid.append((rxn,sc,rdMolDescriptors.GetMACCSKeysFingerprint(m)))
-            else: invalid.append(rxn)
+            else: invalid.append((rxn,sc))
         valid.sort(key=lambda x:-x[1])
         sel, fps = [], []
         for rxn,sc,fp in valid:
@@ -218,25 +306,53 @@ def div_select(scored_triples, n=100):
             for rxn,_,_ in valid:
                 if rxn not in used: sel.append(rxn)
                 if len(sel)>=n: break
-            for rxn in invalid:
+            for rxn,_ in invalid:
                 if rxn not in used: sel.append(rxn)
                 if len(sel)>=n: break
         return sel[:n]
     except:
         return [r for r,_,_ in sorted(scored_triples,key=lambda x:-x[1])[:n]]
 
+
+def best_first_output(all_scored, nmols):
+    """
+    Critical: put the HIGHEST-SCORING molecule FIRST.
+    Validator uses sample_selection:first + num_molecules_boltz:1,
+    meaning only molecule #1 gets Boltz-evaluated.
+    Fill remaining slots with diversity-selected molecules.
+    """
+    trips = [(r,v[0],v[1]) for r,v in all_scored.items() if r and r.startswith('rxn:')]
+    if not trips: return []
+    trips_sorted = sorted(trips, key=lambda x:-x[1])
+    best_rxn = trips_sorted[0][0]
+    if len(trips_sorted) > 1:
+        rest = div_select(trips_sorted[1:], nmols-1)
+    else:
+        rest = []
+    return [best_rxn] + rest
+
+
 def write_out(rxn_ids, note=""):
-    valid=[r for r in rxn_ids if r and r.startswith('rxn:')]
-    tmp=OUTPUT_FILE+'.tmp'
+    valid = [r for r in rxn_ids if r and r.startswith('rxn:')]
+    # Deduplicate while preserving order
+    seen = set(); deduped = []
+    for r in valid:
+        if r not in seen: seen.add(r); deduped.append(r)
+    tmp = OUTPUT_FILE+'.tmp'
     try:
-        with open(tmp,'w') as f: json.dump({"molecules":valid,"n":len(valid),"note":note},f)
+        with open(tmp,'w') as f:
+            json.dump({"molecules":deduped,"n":len(deduped),"note":note},f)
         os.replace(tmp,OUTPUT_FILE)
-        log(f"Output: {len(valid)} rxn: mols ({note})")
+        log(f"Output: {len(deduped)} rxn: mols [{note}]")
     except Exception as e: log(f"write err:{e}")
+
 
 def main():
     t0=time.time()
-    log("="*60); log("NICK Blueprint Miner v2"); log("="*60)
+    log("="*60)
+    log("NICK Blueprint Miner v3 — SN68 Nova Optimized")
+    log("="*60)
+
     data=load_input()
     tgt_raw,ats_raw,aw,tlimit,nmols,db_path=extract_params(data)
     tgt_seq=resolve_seq(tgt_raw)
@@ -247,26 +363,17 @@ def main():
     if not db.ok():
         log("FATAL: No SAVI DB found"); write_out([],"no_db"); return
 
-    # Sample + write immediately
-    log("Initial sample...")
-    init=db.sample(n=500)
+    # ── PHASE 1: Initial sample rxn:1 + rxn:2 ONLY ──────────────────────────
+    log("Phase 1: Sampling rxn:1+rxn:2 only...")
+    init=db.sample_rxn12(n=600)
     init_rxn=[r for r,_ in init]
-    write_out(init_rxn[:nmols],"initial")
+    # Immediate fallback write in case we crash later
+    write_out(init_rxn[:nmols], "initial_rxn12_fallback")
 
+    # ── PHASE 2: Score initial sample ────────────────────────────────────────
     scorer=Scorer()
-    if not scorer.pw or len(str(tgt_seq))<20:
-        log("No PSICHIC/target — template diversity fallback")
-        tmpls={}
-        for rxn,_ in init:
-            t=rxn.replace('rxn:','').split(':')[0]
-            tmpls.setdefault(t,[]).append(rxn)
-        diverse=[]
-        for t in list(tmpls.keys()):
-            diverse.append(tmpls[t][0])
-            if len(diverse)>=nmols: break
-        write_out(diverse,"template_diverse"); return
 
-    # Get SMILES + score initial
+    # Build smi_map
     smi_map={}
     for rxn,smi in init:
         if smi: smi_map[rxn]=smi
@@ -277,74 +384,107 @@ def main():
     all_scored={}
     ranker=ComponentRanker()
 
-    if smi_map:
-        log(f"Scoring {len(smi_map)} initial mols...")
-        sel=scorer.score(tgt_seq,at_seqs,list(smi_map.values()),aw)
-        for rxn,smi in smi_map.items():
-            sc=sel.get(smi,0.0); all_scored[rxn]=(sc,smi); ranker.update(rxn,sc)
-        for rxn,_ in init:
-            if rxn not in all_scored: all_scored[rxn]=(0.0,None)
-        if sel:
-            top5=sorted(sel.items(),key=lambda x:-x[1])[:5]
-            log(f"Init top5:{[round(v,3) for _,v in top5]} mean:{sum(sel.values())/len(sel):.4f}")
-            trips=[(r,v[0],v[1]) for r,v in all_scored.items()]
-            write_out(div_select(trips,nmols),"init_scored")
+    # Pre-compute seed fingerprints for heuristic scoring
+    seed_fps=None
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import rdMolDescriptors
+        seed_fps=[]
+        for s in DAT_SEEDS:
+            m=Chem.MolFromSmiles(s)
+            if m: seed_fps.append(rdMolDescriptors.GetMACCSKeysFingerprint(m))
+        log(f"Seed fingerprints: {len(seed_fps)}")
+    except Exception as e: log(f"RDKit not available: {e}")
 
-    # DJA optimization
+    if smi_map:
+        if scorer.pw:
+            log(f"PSICHIC scoring {len(smi_map)} initial mols...")
+            sel=scorer.score(tgt_seq,at_seqs,list(smi_map.values()),aw)
+            for rxn,smi in smi_map.items():
+                sc=sel.get(smi,0.0)
+                all_scored[rxn]=(sc,smi); ranker.update(rxn,sc)
+            if sel:
+                top5=sorted(sel.items(),key=lambda x:-x[1])[:5]
+                log(f"Init top5 scores:{[round(v,3) for _,v in top5]}")
+        else:
+            log("Using DAT seed-similarity heuristic (no PSICHIC)...")
+            for rxn,smi in smi_map.items():
+                sc=seed_similarity_score(smi,seed_fps)
+                all_scored[rxn]=(sc,smi); ranker.update(rxn,sc)
+            scored_vals=[v for v,_ in all_scored.values() if v>0]
+            if scored_vals:
+                log(f"Heuristic top score:{max(scored_vals):.4f} mean:{sum(scored_vals)/len(scored_vals):.4f}")
+
+    for rxn,_ in init:
+        if rxn not in all_scored: all_scored[rxn]=(0.0,None)
+
+    # Write best-first after initial scoring
+    write_out(best_first_output(all_scored,nmols), "init_scored_best_first")
+
+    # ── PHASE 3: DJA Optimisation (rxn:1+rxn:2 only) ────────────────────────
     remaining=tlimit-(time.time()-t0)-30
     if remaining<60:
-        log("Not enough time for optimization")
+        log("Insufficient time for DJA optimisation")
     else:
-        log(f"DJA optimization ({remaining:.0f}s)...")
+        log(f"DJA optimisation ({remaining:.0f}s available)...")
         best=max((v for v,_ in all_scored.values()),default=0.0)
         pop_A=sorted(all_scored,key=lambda x:-all_scored[x][0])[:200]
         pop_B=sorted(all_scored,key=lambda x:-all_scored[x][0])[200:250]
         tabu=set(all_scored.keys())
         no_improve=0; iteration=0
 
-        while time.time()-t0 < t0+tlimit-30:
-            if time.time()-t0 > tlimit-30: break
+        while time.time()-t0 < tlimit-30:
             try:
                 cands=[]
                 scores_A={k:all_scored[k][0] for k in pop_A if k in all_scored}
                 if scores_A:
                     best_A=max(scores_A,key=lambda x:scores_A[x])
-                    cands+=db.neighbours(best_A,n=10)
+                    cands+=db.neighbours_rxn12(best_A,n=10)
                     for tmpl,_ in ranker.top_tmpls(3):
-                        cands+=db.neighbours(f"rxn:{tmpl}:0",n=5)
+                        # Only explore allowed templates
+                        if tmpl in ['1','2']:
+                            cands+=db.neighbours_rxn12(f"rxn:{tmpl}:0",n=5)
                 for rxn in random.sample(pop_B,min(5,len(pop_B))):
-                    cands+=db.neighbours(rxn,n=3)
+                    cands+=db.neighbours_rxn12(rxn,n=3)
                 if no_improve>=5:
-                    log(f"Anti-plateau iter {iteration}")
-                    cands+=[r for r,_ in db.sample(n=50)]
+                    log(f"Anti-plateau at iter {iteration}")
+                    cands+=[r for r,_ in db.sample_rxn12(n=50)]
+
                 cands=[c for c in set(cands) if c not in tabu and c not in all_scored][:50]
                 tabu.update(cands)
                 if not cands:
-                    cands=[r for r,_ in db.sample(n=20) if r not in all_scored]
+                    cands=[r for r,_ in db.sample_rxn12(n=20) if r not in all_scored]
                     tabu.update(cands)
                 if not cands: time.sleep(2); iteration+=1; continue
 
-                # Score batch
+                # Score batch of up to 25
                 smi_batch={}
                 for rxn in cands[:25]:
                     s=db.smiles_for(rxn)
                     if s: smi_batch[rxn]=s
+
                 if smi_batch:
-                    sel=scorer.score(tgt_seq,at_seqs,list(smi_batch.values()),aw)
-                    for rxn,smi in smi_batch.items():
-                        sc=sel.get(smi,ranker.score(rxn))
-                        all_scored[rxn]=(sc,smi); ranker.update(rxn,sc)
+                    if scorer.pw:
+                        sel=scorer.score(tgt_seq,at_seqs,list(smi_batch.values()),aw)
+                        for rxn,smi in smi_batch.items():
+                            sc=sel.get(smi,ranker.score(rxn))
+                            all_scored[rxn]=(sc,smi); ranker.update(rxn,sc)
+                    else:
+                        for rxn,smi in smi_batch.items():
+                            sc=seed_similarity_score(smi,seed_fps)
+                            all_scored[rxn]=(sc,smi); ranker.update(rxn,sc)
+
                 for rxn in cands:
                     if rxn not in all_scored: all_scored[rxn]=(ranker.score(rxn),None)
 
                 cur_best=max((v for v,_ in all_scored.values()),default=0.0)
                 if cur_best>best:
                     best=cur_best; no_improve=0
-                    log(f"New best:{best:.4f}")
+                    log(f"New best:{best:.4f} at iter {iteration}")
                 else:
                     no_improve+=1
 
-                # Update pops
+                # Update population
                 new_sorted=sorted(all_scored.items(),key=lambda x:-x[1][0])[:15]
                 for rxn,(sc,_) in new_sorted:
                     if rxn not in pop_A:
@@ -353,6 +493,7 @@ def main():
                             worst=min(pop_A,key=lambda x:all_scored.get(x,(0,))[0])
                             if sc>all_scored.get(worst,(0,))[0]:
                                 pop_A.remove(worst); pop_A.append(rxn)
+
                 if iteration%10==0 and pop_A and pop_B:
                     n=min(5,len(pop_A),len(pop_B))
                     wA=sorted(pop_A,key=lambda x:all_scored.get(x,(0,))[0])[:n]
@@ -362,20 +503,22 @@ def main():
                         if bb in pop_B: pop_B.remove(bb)
                         pop_A.append(bb); pop_B.append(wa)
 
-                trips=[(r,v[0],v[1]) for r,v in all_scored.items()]
-                write_out(div_select(trips,nmols),"optimizing")
-                log(f"Iter {iteration}: {len(all_scored)} scored, best={best:.4f}, t={time.time()-t0:.0f}s")
+                # Periodic best-first write
+                if iteration%5==0:
+                    write_out(best_first_output(all_scored,nmols),
+                              f"opt_iter={iteration} best={best:.4f}")
+                    log(f"Iter {iteration}: {len(all_scored)} scored best={best:.4f} t={time.time()-t0:.0f}s")
+
             except Exception as e:
                 log(f"opt err:{e}")
                 import traceback; traceback.print_exc()
             iteration+=1
 
-        # Final write
-        trips=[(r,v[0],v[1]) for r,v in all_scored.items()]
-        final=div_select(trips,nmols)
-        mean=sum(all_scored[m][0] for m in final if m in all_scored)/max(1,len(final))
-        write_out(final,f"final_mean_{mean:.4f}")
-        log(f"Done: {len(final)} rxn: mols, mean={mean:.4f}")
+    # ── FINAL OUTPUT: Best molecule FIRST ────────────────────────────────────
+    final=best_first_output(all_scored,nmols)
+    mean=sum(all_scored[m][0] for m in final if m in all_scored)/max(1,len(final))
+    write_out(final, f"final_mean:{mean:.4f}")
+    log(f"Done: {len(final)} molecules, mean score={mean:.4f}")
 
     db.close()
     log(f"Total time: {time.time()-t0:.0f}s")
