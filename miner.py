@@ -1,869 +1,844 @@
 #!/usr/bin/env python3
 """
-SN68 Blueprint Miner v4 — DPEX_DJA with Environment Audit
-==========================================================
-Combined diagnostic + competitive miner for Nova drug discovery subnet.
+miner.py — DPEX_DJA Blueprint Miner for SN68 Nova
+Dual-Population Discrete Jaya Algorithm with ComponentRanker
 
-Phase 0: Audit Docker environment (what packages, DB, scoring available)
-Phase 1: Initialize populations from SAVI rxn:1/rxn:2 molecules
-Phase 2: DPEX_DJA optimization loop
-Phase 3: Output best molecule first (critical: num_molecules_boltz=1, sample_selection=first)
-
-Diagnostics written to /output/diagnostics.json for environment intelligence.
+Strategy:
+  1. Pre-fetch all reactant pools from SAVI combinatorial DB
+  2. Initialize dual populations (exploration + exploitation)
+  3. Score with PSICHIC via validator scoring module
+  4. Use Jaya update rule to evolve populations toward better reactant combos
+  5. ComponentRanker tracks EMA quality of individual reactants
+  6. Continuously write best molecules to /output/result.json
 """
 
-import json, os, sys, time, sqlite3, random, traceback
+import os
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+
+import sys
+import json
+import time
+import math
+import random
+import sqlite3
+import hashlib
+import traceback
 from pathlib import Path
+from typing import List, Dict, Optional, Tuple, Any
 from collections import defaultdict
 
-# ══════════════════════════════════════════════════════════════
-# CONFIGURATION
-# ══════════════════════════════════════════════════════════════
-ALLOWED_TEMPLATES = {1, 2}
-MAX_TIME_SECONDS = 1500       # 25 min safety (epochs ~30 min)
-POP_A_SIZE = 300              # Global exploration population
-POP_B_SIZE = 100              # Local refinement population
-T_EXCHANGE = 10               # Exchange interval (iterations)
-STALL_THRESHOLD = 5           # Boost mutation after N stalled iters
-MAX_ITERATIONS = 200          # Cap on optimization iterations
-SCORE_BATCH_SIZE = 200        # Max molecules per scoring call
-TABU_MAX = 5000               # Max tabu set size before pruning
-
-# Known high-affinity DAT binder seeds (methylphenidate / GBR analogues)
-DAT_SEEDS = [
-    "COC(=O)C1(c2ccccc2)CCCCN1",                         # methylphenidate
-    "O=C(c1ccccc1)c1ccc(N2CCN(CCCCc3ccccc3)CC2)cc1",    # GBR12909
-    "CC(NC(C)(C)C)C(=O)c1cccc(Cl)c1",                    # bupropion
-    "O=C(OC)C1CC2CCC1(c1ccc(F)cc1)N2C",                  # FECNT
-    "CN1CCc2c(N)cccc2C1c1ccccc1",                         # nomifensine
+# ---------------------------------------------------------------------------
+# Path discovery — the Docker sandbox has nova-blueprint installed; we need
+# to locate the combinatorial DB and the scoring / PSICHIC modules.
+# ---------------------------------------------------------------------------
+_SEARCH_ROOTS = [
+    Path("/workspace"),
+    Path("/"),
+    Path("/app"),
+    Path("/nova-blueprint"),
+    Path("/opt"),
+    Path(os.path.dirname(os.path.abspath(__file__))),
 ]
 
-def log(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def _find_path(name: str, is_dir: bool = True) -> Optional[str]:
+    """Find a file or directory by name across known root paths."""
+    for root in _SEARCH_ROOTS:
+        for depth in range(4):
+            for p in root.glob("/".join(["*"] * depth + [name])):
+                if is_dir and p.is_dir():
+                    return str(p)
+                if not is_dir and p.is_file():
+                    return str(p)
+    return None
 
-def elapsed_since(t0):
-    return time.time() - t0
+
+def _find_db() -> str:
+    """Locate molecules.sqlite in the sandbox."""
+    # Direct known paths first
+    candidates = [
+        "/combinatorial_db/molecules.sqlite",
+        "/workspace/combinatorial_db/molecules.sqlite",
+        "/app/combinatorial_db/molecules.sqlite",
+        "/nova-blueprint/combinatorial_db/molecules.sqlite",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    # Glob search
+    found = _find_path("molecules.sqlite", is_dir=False)
+    if found:
+        return found
+    raise FileNotFoundError("Cannot find molecules.sqlite in Docker sandbox")
 
 
-# ══════════════════════════════════════════════════════════════
-# PHASE 0: ENVIRONMENT AUDIT
-# ══════════════════════════════════════════════════════════════
-def audit_environment():
-    """Dump everything visible in the Docker sandbox to diagnostics.json."""
-    diag = {
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "miner_version": "v4_dpex_dja",
-        "python_version": sys.version,
-        "sys_path": sys.path[:20],
-        "env_vars": dict(os.environ),
-        "cwd": os.getcwd(),
-        "workspace_contents": [],
-        "root_contents": [],
-        "output_dir_exists": os.path.isdir("/output"),
-        "importable": {},
-        "input_json": None,
-        "input_json_path": None,
-        "savi_db_candidates": [],
-        "db_schemas": {},
-    }
+def _setup_imports():
+    """Add necessary paths to sys.path so we can import validator scoring + PSICHIC."""
+    dirs_to_add = set()
+    # Try to find the nova-blueprint root (parent of combinatorial_db, neurons, PSICHIC)
+    for marker in ["neurons", "PSICHIC", "combinatorial_db"]:
+        d = _find_path(marker, is_dir=True)
+        if d:
+            parent = str(Path(d).parent)
+            dirs_to_add.add(parent)
+    # Also add common locations
+    for p in ["/workspace", "/app", "/nova-blueprint", "/"]:
+        if os.path.isdir(p):
+            dirs_to_add.add(p)
+    for d in dirs_to_add:
+        if d not in sys.path:
+            sys.path.insert(0, d)
 
-    # Scan /workspace
-    for root, dirs, files in os.walk("/workspace"):
-        for f in files:
-            fp = os.path.join(root, f)
-            try:
-                sz = os.path.getsize(fp)
-            except:
-                sz = -1
-            diag["workspace_contents"].append({"path": fp, "size_bytes": sz})
-        if root.count(os.sep) > 5:
-            dirs.clear()
 
-    # Scan / top level
+_setup_imports()
+
+# Now import what we need
+try:
+    import bittensor as bt
+except ImportError:
+    # Minimal fallback logging if bt not available
+    class _FallbackLog:
+        @staticmethod
+        def info(msg): print(f"[INFO] {msg}")
+        @staticmethod
+        def warning(msg): print(f"[WARN] {msg}")
+        @staticmethod
+        def error(msg): print(f"[ERROR] {msg}")
+    class bt:
+        logging = _FallbackLog()
+
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors
+    HAS_RDKIT = True
+except ImportError:
+    HAS_RDKIT = False
+
+# Import PSICHIC scoring from the validator module
+try:
+    from neurons.validator.scoring import score_molecules_json
+    import neurons.validator.scoring as scoring_module
+    HAS_PSICHIC_SCORING = True
+except ImportError:
     try:
-        diag["root_contents"] = os.listdir("/")
-    except:
-        pass
+        from validator.scoring import score_molecules_json
+        import validator.scoring as scoring_module
+        HAS_PSICHIC_SCORING = True
+    except ImportError:
+        HAS_PSICHIC_SCORING = False
 
-    # Read input.json
-    for p in ["/workspace/input.json", "/input.json", "input.json",
-              "/workspace/config.json", "/config.json"]:
-        try:
-            with open(p) as f:
-                diag["input_json"] = json.load(f)
-                diag["input_json_path"] = p
-                log(f"Found input at {p}")
-                break
-        except:
-            pass
+# Import reaction utilities
+try:
+    from combinatorial_db.reactions import (
+        get_reaction_info,
+        get_smiles_from_reaction,
+        validate_and_order_reactants,
+        perform_smarts_reaction,
+        combine_triazole_synthons,
+    )
+    HAS_REACTIONS = True
+except ImportError:
+    HAS_REACTIONS = False
 
-    # Check importability
-    for pkg in [
-        "rdkit", "rdkit.Chem", "rdkit.Chem.AllChem", "rdkit.Chem.Descriptors",
-        "rdkit.Chem.DataStructs", "rdkit.Chem.Crippen",
-        "torch", "numpy", "pandas", "scipy", "sklearn", "xgboost",
-        "PSICHIC", "PSICHIC.wrapper",
-        "openbabel", "mordred", "deepchem",
-    ]:
-        try:
-            __import__(pkg)
-            diag["importable"][pkg] = True
-        except ImportError:
-            diag["importable"][pkg] = False
-        except Exception as e:
-            diag["importable"][pkg] = f"error: {e}"
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+INPUT_PATH = "/workspace/input.json"
+OUTPUT_PATH = "/output/result.json"
+SCRATCH_DIR = "/tmp/dpex_dja"
 
-    # Find SQLite databases
-    for search_root in ["/workspace", "/data", "/db", "/savi"]:
-        if not os.path.isdir(search_root):
-            continue
-        for root, dirs, files in os.walk(search_root):
-            for f in files:
-                if f.endswith((".db", ".sqlite", ".sqlite3", ".savi")):
-                    fp = os.path.join(root, f)
-                    diag["savi_db_candidates"].append(fp)
-                    try:
-                        conn = sqlite3.connect(fp)
-                        cur = conn.cursor()
-                        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-                        tables = [r[0] for r in cur.fetchall()]
-                        schema = {"tables": tables, "details": {}}
-                        for t in tables[:10]:
-                            cur.execute(f"PRAGMA table_info([{t}])")
-                            cols = [(r[1], r[2]) for r in cur.fetchall()]
-                            cur.execute(f"SELECT COUNT(*) FROM [{t}]")
-                            cnt = cur.fetchone()[0]
-                            sample = []
-                            try:
-                                cur.execute(f"SELECT * FROM [{t}] LIMIT 3")
-                                sample = [list(r) for r in cur.fetchall()]
-                            except:
-                                pass
-                            schema["details"][t] = {
-                                "columns": cols,
-                                "row_count": cnt,
-                                "sample_rows": sample,
-                            }
-                        conn.close()
-                        diag["db_schemas"][fp] = schema
-                    except Exception as e:
-                        diag["db_schemas"][fp] = {"error": str(e)}
-            if root.count(os.sep) > 5:
-                dirs.clear()
-
-    # Write diagnostics
-    os.makedirs("/output", exist_ok=True)
-    try:
-        with open("/output/diagnostics.json", "w") as f:
-            json.dump(diag, f, indent=2, default=str)
-    except Exception as e:
-        log(f"WARNING: Could not write diagnostics: {e}")
-
-    n_db = len(diag["savi_db_candidates"])
-    psichic = diag["importable"].get("PSICHIC", False)
-    rdkit = diag["importable"].get("rdkit", False)
-    log(f"Audit: {len(diag['workspace_contents'])} files, {n_db} DBs, "
-        f"PSICHIC={'YES' if psichic is True else 'NO'}, "
-        f"RDKit={'YES' if rdkit is True else 'NO'}")
-    return diag
+POP_A_SIZE = 300     # Global exploration population
+POP_B_SIZE = 100     # Local exploitation population
+BATCH_SIZE = 500     # Molecules to sample per iteration
+STALL_THRESHOLD = 5  # Iterations without improvement before mutation boost
+EMA_ALPHA = 0.3      # Exponential moving average smoothing for ComponentRanker
+EXCHANGE_INTERVAL = 3 # Population exchange every N iterations
+TIME_RESERVE_SEC = 30 # Stop this many seconds before deadline
 
 
-# ══════════════════════════════════════════════════════════════
-# SAVI DATABASE ADAPTER
-# ══════════════════════════════════════════════════════════════
+# ===========================================================================
+# ComponentRanker — tracks EMA quality of individual reactants
+# ===========================================================================
+class ComponentRanker:
+    """
+    Maintains an exponential moving average (EMA) of scores for each reactant
+    (identified by mol_id). This lets us bias sampling toward reactants that
+    have historically contributed to high-scoring products.
+    """
+    def __init__(self, alpha: float = EMA_ALPHA):
+        self.alpha = alpha
+        self.ema: Dict[int, float] = {}       # mol_id → EMA score
+        self.count: Dict[int, int] = {}        # mol_id → times seen
+
+    def update(self, mol_ids: List[int], score: float):
+        """Update EMA for each reactant that contributed to a product."""
+        for mid in mol_ids:
+            if mid not in self.ema:
+                self.ema[mid] = score
+                self.count[mid] = 1
+            else:
+                self.ema[mid] = self.alpha * score + (1 - self.alpha) * self.ema[mid]
+                self.count[mid] += 1
+
+    def get_weights(self, mol_ids: List[int]) -> List[float]:
+        """
+        Return sampling weights for a list of mol_ids.
+        Higher EMA → higher weight. Unseen mol_ids get neutral weight.
+        """
+        scores = []
+        for mid in mol_ids:
+            if mid in self.ema:
+                scores.append(self.ema[mid])
+            else:
+                scores.append(0.0)  # neutral
+        # Shift so minimum is 0, then add small epsilon
+        if not scores:
+            return []
+        min_s = min(scores)
+        weights = [s - min_s + 1e-6 for s in scores]
+        return weights
+
+    def top_k(self, k: int = 50) -> List[int]:
+        """Return top-k mol_ids by EMA score."""
+        sorted_ids = sorted(self.ema.keys(), key=lambda x: self.ema[x], reverse=True)
+        return sorted_ids[:k]
+
+
+# ===========================================================================
+# SAVI Database Interface
+# ===========================================================================
 class SAVIDatabase:
-    """Adaptive interface to SAVI SQLite database."""
+    """Interface to the combinatorial molecules.sqlite database."""
 
-    def __init__(self, db_path, diag_schema=None):
-        self.path = db_path
-        self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        self.reactions = self._load_reactions()
+        self.role_pools: Dict[int, List[Tuple[int, str, int]]] = {}
 
-        # Discover schema
-        cur = self.conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        self.tables = [r[0] for r in cur.fetchall()]
+    def _load_reactions(self) -> List[Tuple]:
+        """Load all available reactions."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT rxn_id, smarts, roleA, roleB, roleC FROM reactions")
+        return cursor.fetchall()
 
-        # Find the main product table
-        self.table = None
-        self.smiles_col = None
-        self.name_col = None
-        self.rxn_col = None
-        self.all_cols = []
+    def get_reaction_by_id(self, rxn_id: int) -> Optional[Tuple]:
+        """Get reaction info by ID."""
+        for r in self.reactions:
+            if r[0] == rxn_id:
+                return r
+        return None
 
-        for t in self.tables:
-            cur.execute(f"PRAGMA table_info([{t}])")
-            cols = [(r[1], r[2]) for r in cur.fetchall()]
-            col_names = [c[0] for c in cols]
-            self.all_cols = col_names
-
-            # Detect columns
-            for c in col_names:
-                cl = c.lower()
-                if "smiles" in cl or "product_smi" in cl:
-                    self.smiles_col = c
-                    self.table = t
-                if "name" in cl and "table" not in cl:
-                    self.name_col = c
-                if cl in ("rxn_id", "rxn", "template_id", "reaction_id", "template"):
-                    self.rxn_col = c
-
-            if self.smiles_col:
-                break
-
-        if not self.table and self.tables:
-            self.table = self.tables[0]
-            cur.execute(f"PRAGMA table_info([{self.table}])")
-            cols = [(r[1], r[2]) for r in cur.fetchall()]
-            self.all_cols = [c[0] for c in cols]
-            # Guess smiles column — first TEXT column with length > 5
-            for c in cols:
-                if c[1].upper() in ("TEXT", "VARCHAR", ""):
-                    self.smiles_col = self.smiles_col or c[0]
-            if not self.smiles_col:
-                self.smiles_col = self.all_cols[0]
-
-        log(f"SAVI: table={self.table}, smiles={self.smiles_col}, "
-            f"name={self.name_col}, rxn={self.rxn_col}, cols={self.all_cols[:10]}")
-
-    def sample_rxn12(self, n=500):
-        """Sample n molecules restricted to rxn:1 and rxn:2 templates."""
-        cur = self.conn.cursor()
-        results = []
-
-        for rxn_id in [1, 2]:
-            limit = n // 2
-
-            # Strategy 1: Direct rxn column filter
-            if self.rxn_col:
-                try:
-                    cur.execute(
-                        f"SELECT * FROM [{self.table}] WHERE [{self.rxn_col}] = ? "
-                        f"ORDER BY RANDOM() LIMIT ?",
-                        (rxn_id, limit),
-                    )
-                    rows = cur.fetchall()
-                    if rows:
-                        results.extend(rows)
-                        continue
-                    # Try string version
-                    cur.execute(
-                        f"SELECT * FROM [{self.table}] WHERE [{self.rxn_col}] = ? "
-                        f"ORDER BY RANDOM() LIMIT ?",
-                        (str(rxn_id), limit),
-                    )
-                    rows = cur.fetchall()
-                    if rows:
-                        results.extend(rows)
-                        continue
-                except:
-                    pass
-
-            # Strategy 2: LIKE on name column (rxn:1:... format)
-            if self.name_col:
-                try:
-                    cur.execute(
-                        f"SELECT * FROM [{self.table}] WHERE [{self.name_col}] LIKE ? "
-                        f"ORDER BY RANDOM() LIMIT ?",
-                        (f"rxn:{rxn_id}:%", limit),
-                    )
-                    rows = cur.fetchall()
-                    if rows:
-                        results.extend(rows)
-                        continue
-                except:
-                    pass
-
-            # Strategy 3: LIKE on any text column
-            for col in self.all_cols:
-                try:
-                    cur.execute(
-                        f"SELECT * FROM [{self.table}] WHERE [{col}] LIKE ? "
-                        f"ORDER BY RANDOM() LIMIT ?",
-                        (f"%rxn:{rxn_id}%", limit),
-                    )
-                    rows = cur.fetchall()
-                    if rows:
-                        results.extend(rows)
-                        break
-                except:
-                    pass
-
-        # Fallback: random sample if no rxn filtering worked
-        if not results:
-            try:
-                cur.execute(
-                    f"SELECT * FROM [{self.table}] ORDER BY RANDOM() LIMIT ?", (n,)
-                )
-                results = cur.fetchall()
-                log(f"WARNING: rxn filter failed, random sample of {len(results)}")
-            except:
-                pass
-
-        log(f"Sampled {len(results)} molecules from SAVI (rxn:1+2 target)")
+    def get_molecules_by_role(self, role_mask: int) -> List[Tuple[int, str, int]]:
+        """Get all molecules matching a role mask, with caching."""
+        if role_mask in self.role_pools:
+            return self.role_pools[role_mask]
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "SELECT mol_id, smiles, role_mask FROM molecules WHERE (role_mask & ?) = ?",
+            (role_mask, role_mask)
+        )
+        results = cursor.fetchall()
+        self.role_pools[role_mask] = results
+        bt.logging.info(f"Loaded {len(results)} molecules for role_mask={role_mask}")
         return results
 
-    def get_neighbours(self, smiles_or_row, n=20):
-        """Get structurally neighbouring molecules (same template, vary reactants)."""
-        cur = self.conn.cursor()
+    def close(self):
+        self.conn.close()
 
-        # Try to extract rxn info from name
-        name = ""
-        if hasattr(smiles_or_row, "keys"):
-            d = dict(smiles_or_row)
-            name = str(d.get(self.name_col, "")) if self.name_col else ""
 
-        parts = name.split(":")
-        if len(parts) >= 4:
-            # Format: rxn:ID:REACTANT1:REACTANT2 — keep rxn:ID, vary reactants
-            rxn_prefix = f"{parts[0]}:{parts[1]}:"
-            try:
-                cur.execute(
-                    f"SELECT * FROM [{self.table}] WHERE [{self.name_col}] LIKE ? "
-                    f"ORDER BY RANDOM() LIMIT ?",
-                    (rxn_prefix + "%", n),
-                )
-                rows = cur.fetchall()
-                if rows:
-                    return rows
-            except:
-                pass
-
-        # Fallback: random within same rxn template
-        for rxn_id in [1, 2]:
-            if self.rxn_col:
-                try:
-                    cur.execute(
-                        f"SELECT * FROM [{self.table}] WHERE [{self.rxn_col}] = ? "
-                        f"ORDER BY RANDOM() LIMIT ?",
-                        (rxn_id, n),
-                    )
-                    rows = cur.fetchall()
-                    if rows:
-                        return rows
-                except:
-                    pass
-
-        # Last resort
-        try:
-            cur.execute(
-                f"SELECT * FROM [{self.table}] ORDER BY RANDOM() LIMIT ?", (n,)
-            )
-            return cur.fetchall()
-        except:
-            return []
-
-    def extract_smiles(self, row):
-        """Pull SMILES string from a database row."""
-        if hasattr(row, "keys"):
-            d = dict(row)
-            if self.smiles_col and self.smiles_col in d:
-                return str(d[self.smiles_col])
-            # Try all columns
-            for v in d.values():
-                s = str(v)
-                if len(s) > 5 and any(c in s for c in "CNOcn()="):
-                    return s
+# ===========================================================================
+# Molecule Generation & Validation
+# ===========================================================================
+def compute_product_smiles_safe(
+    rxn_id: int, smarts: str,
+    roleA: int, roleB: int, roleC: Optional[int],
+    molA: Tuple, molB: Tuple, molC: Optional[Tuple] = None
+) -> Optional[str]:
+    """Compute product SMILES from reactants, handling all reaction types."""
+    if not HAS_REACTIONS:
+        return None
+    try:
+        _, smiA, rmA = molA
+        _, smiB, rmB = molB
+        if roleC and roleC != 0 and molC:
+            _, smiC, rmC = molC
+            v = validate_and_order_reactants(smiA, smiB, rmA, rmB, roleA, roleB, smiC, rmC, roleC)
+            if not all(v):
+                return None
+            r1, r2, r3 = v
+            if rxn_id == 3:
+                triazole_cooh = combine_triazole_synthons(r1, r2)
+                if not triazole_cooh:
+                    return None
+                amide_smarts = "[C:1](=O)[OH].[N:2]>>[C:1](=O)[N:2]"
+                return perform_smarts_reaction(triazole_cooh, r3, amide_smarts)
+            if rxn_id == 5:
+                suzuki_br = "[#6:1][Br].[#6:2][B]([OH])[OH]>>[#6:1][#6:2]"
+                suzuki_cl = "[#6:1][Cl].[#6:2][B]([OH])[OH]>>[#6:1][#6:2]"
+                intermediate = perform_smarts_reaction(r1, r2, suzuki_br)
+                if not intermediate:
+                    return None
+                return perform_smarts_reaction(intermediate, r3, suzuki_cl)
+            return None
+        else:
+            r1, r2 = validate_and_order_reactants(smiA, smiB, rmA, rmB, roleA, roleB)
+            if not r1 or not r2:
+                return None
+            if rxn_id == 1:
+                return combine_triazole_synthons(r1, r2)
+            return perform_smarts_reaction(r1, r2, smarts)
+    except Exception:
         return None
 
-    def extract_name(self, row):
-        """Pull name/ID from a database row."""
-        if hasattr(row, "keys"):
-            d = dict(row)
-            if self.name_col and self.name_col in d:
-                return str(d[self.name_col])
-        return ""
 
-    def decompose(self, row):
-        """Extract reactant components from a SAVI molecule entry."""
-        name = self.extract_name(row)
-        parts = name.split(":")
-        if len(parts) >= 3:
-            return {
-                "rxn": f"{parts[0]}:{parts[1]}",
-                "reactants": parts[2:],
-                "key": name,
-            }
-        return {"rxn": "unknown", "reactants": [name], "key": name}
-
-
-# ══════════════════════════════════════════════════════════════
-# COMPONENT RANKER (EMA-based reactant quality tracker)
-# ══════════════════════════════════════════════════════════════
-class ComponentRanker:
-    """Track which reactant building blocks appear in high-scoring molecules."""
-
-    def __init__(self, alpha=0.1):
-        self.alpha = alpha
-        self.scores = defaultdict(lambda: 0.5)
-        self.counts = defaultdict(int)
-
-    def update(self, components, score):
-        for comp in components:
-            old = self.scores[comp]
-            self.scores[comp] = self.alpha * score + (1 - self.alpha) * old
-            self.counts[comp] += 1
-
-    def rank(self, comp):
-        return self.scores[comp]
-
-    def bias_weight(self, components):
-        """Return a composite weight for a set of components (higher = better)."""
-        if not components:
-            return 0.5
-        return sum(self.scores[c] for c in components) / len(components)
-
-    def top_n(self, n=50):
-        return sorted(self.scores.items(), key=lambda x: -x[1])[:n]
+def validate_molecule(smiles: str, config: dict) -> bool:
+    """Check if a molecule meets the config constraints."""
+    if not smiles or not HAS_RDKIT:
+        return False
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return False
+        ha = mol.GetNumHeavyAtoms()
+        if ha < config.get("min_heavy_atoms", 20):
+            return False
+        rot = Descriptors.NumRotatableBonds(mol)
+        if rot < config.get("min_rotatable_bonds", 1):
+            return False
+        if rot > config.get("max_rotatable_bonds", 10):
+            return False
+        return True
+    except Exception:
+        return False
 
 
-# ══════════════════════════════════════════════════════════════
-# SCORER — PSICHIC if available, else RDKit heuristic
-# ══════════════════════════════════════════════════════════════
-class Scorer:
-    def __init__(self, diag):
-        self.psichic_available = False
-        self.rdkit_available = False
-        self.pw = None
-        self.seed_fps = []
-        self._score_cache = {}
+# ===========================================================================
+# Individual — represents a single molecule solution
+# ===========================================================================
+class Individual:
+    """A molecule defined by its reactant combination."""
+    __slots__ = ['rxn_id', 'mol_ids', 'name', 'smiles', 'score', 'valid']
 
-        # Try PSICHIC
-        if diag["importable"].get("PSICHIC") is True or \
-           diag["importable"].get("PSICHIC.wrapper") is True:
-            try:
-                from PSICHIC.wrapper import PsichicWrapper
-                self.pw = PsichicWrapper()
-                self.psichic_available = True
-                log("PSICHIC loaded and ready!")
-            except Exception as e:
-                log(f"PSICHIC import ok but init failed: {e}")
+    def __init__(self, rxn_id: int, mol_ids: List[int], name: str = "",
+                 smiles: str = "", score: float = float('-inf'), valid: bool = False):
+        self.rxn_id = rxn_id
+        self.mol_ids = mol_ids
+        self.name = name
+        self.smiles = smiles
+        self.score = score
+        self.valid = valid
 
-        # Try RDKit
-        if diag["importable"].get("rdkit") is True or \
-           diag["importable"].get("rdkit.Chem") is True:
-            try:
-                from rdkit import Chem
-                from rdkit.Chem import AllChem, Descriptors, DataStructs
-                self._Chem = Chem
-                self._AllChem = AllChem
-                self._Desc = Descriptors
-                self._DS = DataStructs
-                self.rdkit_available = True
-
-                # Pre-compute DAT seed fingerprints
-                for smi in DAT_SEEDS:
-                    mol = Chem.MolFromSmiles(smi)
-                    if mol:
-                        fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, 2048)
-                        self.seed_fps.append(fp)
-                log(f"RDKit loaded, {len(self.seed_fps)} seed fingerprints")
-            except Exception as e:
-                log(f"RDKit import error: {e}")
-
-    def score_batch(self, smiles_list, target, antitargets):
-        """Score molecules, using cache to avoid redundant computation."""
-        uncached = [s for s in smiles_list if s not in self._score_cache]
-
-        if uncached:
-            if self.psichic_available:
-                new_scores = self._psichic_score(uncached, target, antitargets)
-            elif self.rdkit_available:
-                new_scores = self._heuristic_score(uncached)
-            else:
-                new_scores = {s: random.uniform(0.0, 0.3) for s in uncached}
-            self._score_cache.update(new_scores)
-
-        return {s: self._score_cache.get(s, 0.0) for s in smiles_list}
-
-    def _psichic_score(self, smiles_list, target, antitargets):
-        """Full PSICHIC scoring: target - 0.9 * max(antitargets)."""
-        scores = {}
-        try:
-            target_aff = self._screen_protein(target, smiles_list)
-            anti_max = defaultdict(float)
-            for at in antitargets:
-                at_scores = self._screen_protein(at, smiles_list)
-                for smi, v in at_scores.items():
-                    anti_max[smi] = max(anti_max[smi], v)
-
-            for smi in smiles_list:
-                ts = target_aff.get(smi, 0.0)
-                at = anti_max.get(smi, 0.0)
-                scores[smi] = ts - 0.9 * at
-        except Exception as e:
-            log(f"PSICHIC batch error: {e}")
-            traceback.print_exc()
-            scores = self._heuristic_score(smiles_list)
-        return scores
-
-    def _screen_protein(self, protein_id, smiles_list):
-        """Screen SMILES against one protein using PSICHIC."""
-        seq = self._fetch_seq(protein_id)
-        if not seq:
-            return {}
-        try:
-            self.pw.run_challenge_start(seq)
-            # Process in batches
-            all_scores = {}
-            for i in range(0, len(smiles_list), SCORE_BATCH_SIZE):
-                batch = smiles_list[i : i + SCORE_BATCH_SIZE]
-                df = self.pw.run_validation(batch)
-                for _, row in df.iterrows():
-                    smi = str(row.get("Ligand", ""))
-                    aff = float(row.get("predicted_binding_affinity", 0.0))
-                    all_scores[smi] = aff
-            return all_scores
-        except Exception as e:
-            log(f"Screen {protein_id} error: {e}")
-            return {}
-
-    def _fetch_seq(self, uniprot_id):
-        """Fetch protein FASTA sequence from UniProt."""
-        import urllib.request
-        for url in [
-            f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.fasta",
-            f"https://www.uniprot.org/uniprot/{uniprot_id}.fasta",
-        ]:
-            try:
-                with urllib.request.urlopen(url, timeout=30) as r:
-                    fasta = r.read().decode()
-                lines = fasta.strip().split("\n")
-                seq = "".join(l for l in lines if not l.startswith(">"))
-                if seq:
-                    return seq
-            except:
-                pass
-        return None
-
-    def _heuristic_score(self, smiles_list):
-        """Tanimoto-to-DAT-seeds weighted by heavy atom efficiency."""
-        scores = {}
-        if not self.rdkit_available or not self.seed_fps:
-            return {s: random.uniform(0.0, 0.3) for s in smiles_list}
-
-        Chem = self._Chem
-        AllChem = self._AllChem
-        DS = self._DS
-        for smi in smiles_list:
-            try:
-                mol = Chem.MolFromSmiles(smi)
-                if not mol:
-                    scores[smi] = 0.0
-                    continue
-                fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, 2048)
-                ha = mol.GetNumHeavyAtoms()
-                # Tanimoto to best DAT seed
-                max_sim = max(DS.TanimotoSimilarity(fp, sfp) for sfp in self.seed_fps)
-                # Heavy atom normalization: smaller potent molecules score higher
-                ha_factor = min(1.0, 20.0 / max(ha, 10))
-                # Drug-likeness bonus
-                mw = self._Desc.MolWt(mol)
-                logp = self._Desc.MolLogP(mol)
-                rb = self._Desc.NumRotatableBonds(mol)
-                dl_penalty = 0.0
-                if mw > 500:
-                    dl_penalty += 0.1
-                if logp > 5:
-                    dl_penalty += 0.1
-                if rb > 10:
-                    dl_penalty += 0.05
-                scores[smi] = max(0.0, max_sim * ha_factor - dl_penalty)
-            except:
-                scores[smi] = 0.0
-        return scores
+    def __repr__(self):
+        return f"Individual({self.name}, score={self.score:.4f})"
 
 
-# ══════════════════════════════════════════════════════════════
-# DPEX_DJA OPTIMIZER
-# ══════════════════════════════════════════════════════════════
+# ===========================================================================
+# DPEX_DJA Optimizer
+# ===========================================================================
 class DPEX_DJA:
     """
-    Discrete Population Exchange — Discrete Jaya Algorithm.
+    Dual-Population Discrete Jaya Algorithm.
 
-    Pop A (large): Global exploration via Jaya-inspired discrete updates.
-    Pop B (focused): Local refinement via tabu-enhanced neighbourhood search.
-    Periodic exchange of top individuals between populations.
-    ComponentRanker learns which reactant building blocks produce signal.
+    Pop A (large): global exploration via DJA update rule
+    Pop B (small): local refinement via tabu-enhanced neighbourhood search
     """
 
-    def __init__(self, db, scorer, target, antitargets):
+    def __init__(self, db: SAVIDatabase, config: dict, rxn_id: int):
         self.db = db
-        self.scorer = scorer
-        self.target = target
-        self.antitargets = antitargets
-        self.ranker = ComponentRanker(alpha=0.1)
-        self.tabu = set()
-        self.best_score = float("-inf")
-        self.best_smi = None
-        self.stall = 0
-        self.mutation_prob = 0.1
-        self.all_scored = {}  # smiles -> score
+        self.config = config
+        self.rxn_id = rxn_id
+        self.ranker = ComponentRanker()
 
-    def _rows_to_mols(self, rows):
-        """Convert DB rows to molecule dicts."""
-        mols = []
-        seen = set()
-        for row in rows:
-            smi = self.db.extract_smiles(row)
-            if smi and smi not in seen:
-                seen.add(smi)
-                mols.append({"smiles": smi, "row": row, "score": 0.0})
-        return mols
+        # Get reaction info
+        rxn_info = db.get_reaction_by_id(rxn_id)
+        if not rxn_info:
+            raise ValueError(f"Reaction {rxn_id} not found in database")
+        self.smarts = rxn_info[1]
+        self.roleA = rxn_info[2]
+        self.roleB = rxn_info[3]
+        self.roleC = rxn_info[4] if rxn_info[4] and rxn_info[4] != 0 else None
+        self.is_three_component = self.roleC is not None
 
-    def _score_mols(self, mols):
-        """Score a list of molecule dicts, update ranker and cache."""
-        unscored = [m for m in mols if m["smiles"] not in self.all_scored]
-        if unscored:
-            batch = [m["smiles"] for m in unscored]
-            scores = self.scorer.score_batch(batch, self.target, self.antitargets)
-            for m in unscored:
-                m["score"] = scores.get(m["smiles"], 0.0)
-                self.all_scored[m["smiles"]] = m["score"]
-                # Update component ranker
-                comps = self.db.decompose(m["row"])
-                self.ranker.update(comps.get("reactants", []), m["score"])
-        # Fill cached scores
-        for m in mols:
-            if m["smiles"] in self.all_scored:
-                m["score"] = self.all_scored[m["smiles"]]
+        # Pre-fetch reactant pools
+        self.pool_A = db.get_molecules_by_role(self.roleA)
+        self.pool_B_react = db.get_molecules_by_role(self.roleB)
+        self.pool_C = db.get_molecules_by_role(self.roleC) if self.is_three_component else []
 
-    def initialize(self):
-        """Seed both populations from SAVI database."""
-        log("Initializing DPEX_DJA populations...")
-        rows = self.db.sample_rxn12(n=POP_A_SIZE + POP_B_SIZE + 200)
-        mols = self._rows_to_mols(rows)
+        # Index pools by mol_id for fast lookup
+        self.idx_A = {m[0]: m for m in self.pool_A}
+        self.idx_B = {m[0]: m for m in self.pool_B_react}
+        self.idx_C = {m[0]: m for m in self.pool_C} if self.is_three_component else {}
 
-        if not mols:
-            log("WARNING: No SAVI molecules found, seeding with DAT_SEEDS")
-            mols = [{"smiles": s, "row": None, "score": 0.0} for s in DAT_SEEDS]
+        # Populations
+        self.pop_a: List[Individual] = []
+        self.pop_b: List[Individual] = []
 
-        self._score_mols(mols)
-        mols.sort(key=lambda x: -x["score"])
+        # Best ever
+        self.best_ever: Optional[Individual] = None
 
-        self.pop_a = mols[: POP_A_SIZE]
-        self.pop_b = mols[POP_A_SIZE : POP_A_SIZE + POP_B_SIZE]
+        # Stall counter for anti-plateau
+        self.stall_count = 0
+        self.last_best_score = float('-inf')
 
-        if mols:
-            self.best_smi = mols[0]["smiles"]
-            self.best_score = mols[0]["score"]
+        # Tabu set for Pop B
+        self.tabu_set: set = set()
 
-        log(
-            f"Init: A={len(self.pop_a)} B={len(self.pop_b)} "
-            f"best={self.best_score:.4f} total_scored={len(self.all_scored)}"
+        bt.logging.info(
+            f"DPEX_DJA initialized: rxn={rxn_id}, "
+            f"poolA={len(self.pool_A)}, poolB={len(self.pool_B_react)}, "
+            f"poolC={len(self.pool_C)}, 3-comp={self.is_three_component}"
         )
 
-    def jaya_update(self):
-        """Global exploration: inject new molecules biased toward high-ranked components."""
-        new_mols = []
-        # Sample neighbours of top Pop A molecules
-        for mol in self.pop_a[:30]:
-            if mol["row"] is None:
-                continue
-            neighbours = self.db.get_neighbours(mol["row"], n=5)
-            for nb in neighbours:
-                smi = self.db.extract_smiles(nb)
-                if smi and smi not in self.all_scored:
-                    new_mols.append({"smiles": smi, "row": nb, "score": 0.0})
+    def _make_individual(self, molA: Tuple, molB: Tuple, molC: Optional[Tuple] = None) -> Individual:
+        """Create an Individual from reactant tuples."""
+        idA, _, _ = molA
+        idB, _, _ = molB
+        if self.is_three_component and molC:
+            idC, _, _ = molC
+            name = f"rxn:{self.rxn_id}:{idA}:{idB}:{idC}"
+            mol_ids = [idA, idB, idC]
+        else:
+            name = f"rxn:{self.rxn_id}:{idA}:{idB}"
+            mol_ids = [idA, idB]
 
-        # Anti-stall mutation: inject random rxn:1/2 molecules
-        if self.stall >= STALL_THRESHOLD:
-            extra_rows = self.db.sample_rxn12(n=max(30, int(50 * self.mutation_prob)))
-            for row in extra_rows:
-                smi = self.db.extract_smiles(row)
-                if smi and smi not in self.all_scored:
-                    new_mols.append({"smiles": smi, "row": row, "score": 0.0})
+        smiles = compute_product_smiles_safe(
+            self.rxn_id, self.smarts,
+            self.roleA, self.roleB, self.roleC,
+            molA, molB, molC
+        )
+        valid = smiles is not None and validate_molecule(smiles, self.config)
+        return Individual(self.rxn_id, mol_ids, name, smiles or "", float('-inf'), valid)
 
-        if new_mols:
-            self._score_mols(new_mols)
-            combined = self.pop_a + new_mols
-            combined.sort(key=lambda x: -x["score"])
-            self.pop_a = combined[: POP_A_SIZE]
+    def _random_individual(self) -> Individual:
+        """Generate a random valid individual."""
+        for _ in range(20):  # Try up to 20 times
+            molA = random.choice(self.pool_A)
+            molB = random.choice(self.pool_B_react)
+            molC = random.choice(self.pool_C) if self.is_three_component else None
+            ind = self._make_individual(molA, molB, molC)
+            if ind.valid:
+                return ind
+        # Return invalid individual as last resort
+        molA = random.choice(self.pool_A)
+        molB = random.choice(self.pool_B_react)
+        molC = random.choice(self.pool_C) if self.is_three_component else None
+        return self._make_individual(molA, molB, molC)
 
-    def tabu_search(self):
-        """Local refinement: explore neighbours of Pop B, avoid repeats."""
-        new_mols = []
-        for mol in self.pop_b[:20]:
-            if mol["row"] is None:
-                continue
-            neighbours = self.db.get_neighbours(mol["row"], n=10)
-            for nb in neighbours:
-                smi = self.db.extract_smiles(nb)
-                if smi and smi not in self.tabu and smi not in self.all_scored:
-                    new_mols.append({"smiles": smi, "row": nb, "score": 0.0})
-                    self.tabu.add(smi)
+    def _biased_individual(self) -> Individual:
+        """Generate individual biased toward high-quality reactants via ComponentRanker."""
+        for _ in range(20):
+            # Biased selection for pool A
+            pool_a_ids = [m[0] for m in self.pool_A]
+            weights_a = self.ranker.get_weights(pool_a_ids)
+            if weights_a and sum(weights_a) > 0:
+                molA = random.choices(self.pool_A, weights=weights_a, k=1)[0]
+            else:
+                molA = random.choice(self.pool_A)
 
-        # Prune tabu if too large
-        if len(self.tabu) > TABU_MAX:
-            self.tabu = set(list(self.tabu)[-TABU_MAX // 2 :])
+            # Biased selection for pool B
+            pool_b_ids = [m[0] for m in self.pool_B_react]
+            weights_b = self.ranker.get_weights(pool_b_ids)
+            if weights_b and sum(weights_b) > 0:
+                molB = random.choices(self.pool_B_react, weights=weights_b, k=1)[0]
+            else:
+                molB = random.choice(self.pool_B_react)
 
-        if new_mols:
-            self._score_mols(new_mols)
-            combined = self.pop_b + new_mols
-            combined.sort(key=lambda x: -x["score"])
-            self.pop_b = combined[: POP_B_SIZE]
+            molC = None
+            if self.is_three_component:
+                pool_c_ids = [m[0] for m in self.pool_C]
+                weights_c = self.ranker.get_weights(pool_c_ids)
+                if weights_c and sum(weights_c) > 0:
+                    molC = random.choices(self.pool_C, weights=weights_c, k=1)[0]
+                else:
+                    molC = random.choice(self.pool_C)
 
-    def exchange(self):
-        """Swap top individuals between populations."""
+            ind = self._make_individual(molA, molB, molC)
+            if ind.valid:
+                return ind
+        return self._random_individual()
+
+    def initialize_populations(self, n_a: int = POP_A_SIZE, n_b: int = POP_B_SIZE):
+        """Create initial random populations."""
+        bt.logging.info(f"Initializing Pop A ({n_a}) and Pop B ({n_b})...")
+        self.pop_a = [self._random_individual() for _ in range(n_a)]
+        self.pop_b = [self._random_individual() for _ in range(n_b)]
+        # Filter to valid only, refill
+        self.pop_a = [ind for ind in self.pop_a if ind.valid]
+        self.pop_b = [ind for ind in self.pop_b if ind.valid]
+        while len(self.pop_a) < n_a:
+            ind = self._random_individual()
+            if ind.valid:
+                self.pop_a.append(ind)
+        while len(self.pop_b) < n_b:
+            ind = self._random_individual()
+            if ind.valid:
+                self.pop_b.append(ind)
+        bt.logging.info(f"Populations ready: A={len(self.pop_a)}, B={len(self.pop_b)}")
+
+    def _jaya_mutate(self, current: Individual, best: Individual, worst: Individual) -> Individual:
+        """
+        Discrete Jaya update: for each reactant slot, probabilistically
+        move toward best's reactant and away from worst's reactant.
+        """
+        new_mol_ids = []
+        pools = [self.pool_A, self.pool_B_react]
+        idxs = [self.idx_A, self.idx_B]
+        if self.is_three_component:
+            pools.append(self.pool_C)
+            idxs.append(self.idx_C)
+
+        for slot_idx in range(len(current.mol_ids)):
+            curr_id = current.mol_ids[slot_idx]
+            best_id = best.mol_ids[slot_idx]
+            worst_id = worst.mol_ids[slot_idx]
+            pool = pools[slot_idx]
+            idx = idxs[slot_idx]
+
+            r1 = random.random()
+            r2 = random.random()
+
+            if r1 > 0.5 and best_id in idx:
+                # Move toward best: use best's reactant
+                new_mol_ids.append(best_id)
+            elif r2 > 0.5 and worst_id != curr_id:
+                # Move away from worst: pick a biased random (not worst)
+                candidates = [m for m in pool if m[0] != worst_id]
+                if candidates:
+                    pool_ids = [m[0] for m in candidates]
+                    weights = self.ranker.get_weights(pool_ids)
+                    if weights and sum(weights) > 0:
+                        choice = random.choices(candidates, weights=weights, k=1)[0]
+                    else:
+                        choice = random.choice(candidates)
+                    new_mol_ids.append(choice[0])
+                else:
+                    new_mol_ids.append(curr_id)
+            else:
+                # Keep current
+                new_mol_ids.append(curr_id)
+
+        # Build new individual from selected mol_ids
+        molA = self.idx_A.get(new_mol_ids[0])
+        molB = self.idx_B.get(new_mol_ids[1])
+        molC = self.idx_C.get(new_mol_ids[2]) if self.is_three_component and len(new_mol_ids) > 2 else None
+
+        if molA and molB:
+            return self._make_individual(molA, molB, molC)
+        return self._random_individual()
+
+    def _neighbourhood_search(self, ind: Individual) -> Individual:
+        """
+        Local search for Pop B: swap one reactant slot with a nearby reactant.
+        Uses tabu to avoid revisiting.
+        """
+        pools = [self.pool_A, self.pool_B_react]
+        idxs = [self.idx_A, self.idx_B]
+        if self.is_three_component:
+            pools.append(self.pool_C)
+            idxs.append(self.idx_C)
+
+        # Pick a random slot to mutate
+        slot = random.randint(0, len(ind.mol_ids) - 1)
+        pool = pools[slot]
+
+        # Biased selection toward high-quality reactants
+        pool_ids = [m[0] for m in pool]
+        weights = self.ranker.get_weights(pool_ids)
+        if weights and sum(weights) > 0:
+            new_reactant = random.choices(pool, weights=weights, k=1)[0]
+        else:
+            new_reactant = random.choice(pool)
+
+        new_mol_ids = list(ind.mol_ids)
+        new_mol_ids[slot] = new_reactant[0]
+
+        # Check tabu
+        key = tuple(new_mol_ids)
+        if key in self.tabu_set:
+            return self._biased_individual()
+        self.tabu_set.add(key)
+
+        molA = self.idx_A.get(new_mol_ids[0])
+        molB = self.idx_B.get(new_mol_ids[1])
+        molC = self.idx_C.get(new_mol_ids[2]) if self.is_three_component and len(new_mol_ids) > 2 else None
+        if molA and molB:
+            return self._make_individual(molA, molB, molC)
+        return self._biased_individual()
+
+    def score_population(self, population: List[Individual], config: dict) -> List[Individual]:
+        """Score a list of Individuals using PSICHIC."""
+        if not HAS_PSICHIC_SCORING:
+            bt.logging.warning("PSICHIC scoring not available, using random scores")
+            for ind in population:
+                ind.score = random.uniform(-2, 2) if ind.valid else float('-inf')
+            return population
+
+        # Filter to valid individuals
+        valid_inds = [ind for ind in population if ind.valid and ind.smiles]
+        if not valid_inds:
+            return population
+
+        # Build sampler-format JSON for scoring
+        molecules = [ind.name for ind in valid_inds]
+        sampler_data = {"molecules": molecules}
+
+        os.makedirs(SCRATCH_DIR, exist_ok=True)
+        sampler_path = os.path.join(SCRATCH_DIR, "batch.json")
+        with open(sampler_path, "w") as f:
+            json.dump(sampler_data, f)
+
+        try:
+            target_seqs = config.get("target_sequences", [])
+            antitarget_seqs = config.get("antitarget_sequences", [])
+
+            score_dict = score_molecules_json(
+                sampler_path, target_seqs, antitarget_seqs, config
+            )
+
+            if score_dict:
+                # Extract per-molecule scores
+                for uid, data in score_dict.items():
+                    targets = data.get("ps_target_scores", [])
+                    antitargets = data.get("ps_antitarget_scores", [])
+                    antitarget_weight = config.get("antitarget_weight", 0.9)
+
+                    for mol_idx, ind in enumerate(valid_inds):
+                        if mol_idx >= len(targets[0]) if targets and targets[0] else True:
+                            continue
+                        # Average target scores
+                        t_scores = [t[mol_idx] for t in targets if mol_idx < len(t)]
+                        avg_target = sum(t_scores) / len(t_scores) if t_scores else 0
+
+                        # Average antitarget scores
+                        a_scores = [a[mol_idx] for a in antitargets if mol_idx < len(a)]
+                        avg_antitarget = sum(a_scores) / len(a_scores) if a_scores else 0
+
+                        ind.score = avg_target - antitarget_weight * avg_antitarget
+
+                        # Update ComponentRanker
+                        self.ranker.update(ind.mol_ids, ind.score)
+                    break  # Only one UID in our scoring
+        except Exception as e:
+            bt.logging.error(f"Scoring error: {e}")
+            traceback.print_exc()
+
+        return population
+
+    def evolve_pop_a(self) -> List[Individual]:
+        """Jaya update on Population A (global exploration)."""
+        if not self.pop_a:
+            return []
+
+        scored = [ind for ind in self.pop_a if ind.score > float('-inf')]
+        if len(scored) < 2:
+            return self.pop_a
+
+        best = max(scored, key=lambda x: x.score)
+        worst = min(scored, key=lambda x: x.score)
+
+        # Mutation probability increases when stalled
+        mutation_boost = min(0.8, 0.1 + 0.1 * self.stall_count) if self.stall_count >= STALL_THRESHOLD else 0.0
+
+        new_pop = []
+        for ind in self.pop_a:
+            if random.random() < mutation_boost:
+                # Anti-stall: inject random biased individual
+                candidate = self._biased_individual()
+            else:
+                candidate = self._jaya_mutate(ind, best, worst)
+
+            if candidate.valid:
+                new_pop.append(candidate)
+            else:
+                new_pop.append(ind)  # Keep current if mutation invalid
+
+        return new_pop
+
+    def evolve_pop_b(self) -> List[Individual]:
+        """Tabu neighbourhood search on Population B (local exploitation)."""
+        new_pop = []
+        for ind in self.pop_b:
+            candidate = self._neighbourhood_search(ind)
+            if candidate.valid:
+                new_pop.append(candidate)
+            else:
+                new_pop.append(ind)
+        return new_pop
+
+    def exchange_populations(self):
+        """Transfer best from each population to the other."""
         if not self.pop_a or not self.pop_b:
             return
-        n = max(1, min(len(self.pop_a), len(self.pop_b)) // 10)
-        top_b = self.pop_b[:n]
-        top_a = self.pop_a[:n]
-        self.pop_a = sorted(self.pop_a + top_b, key=lambda x: -x["score"])[: POP_A_SIZE]
-        self.pop_b = sorted(self.pop_b + top_a, key=lambda x: -x["score"])[: POP_B_SIZE]
 
-    def run(self, max_time, max_iter=MAX_ITERATIONS):
-        """Main optimization loop."""
-        t0 = time.time()
-        for it in range(max_iter):
-            if elapsed_since(t0) > max_time:
-                log(f"Time limit at iter {it}")
-                break
+        # Best of A → B, best of B → A
+        scored_a = [ind for ind in self.pop_a if ind.score > float('-inf')]
+        scored_b = [ind for ind in self.pop_b if ind.score > float('-inf')]
 
-            prev_best = self.best_score
+        if scored_a:
+            best_a = max(scored_a, key=lambda x: x.score)
+            # Replace worst in B
+            if self.pop_b:
+                worst_b_idx = min(range(len(self.pop_b)), key=lambda i: self.pop_b[i].score)
+                if best_a.score > self.pop_b[worst_b_idx].score:
+                    self.pop_b[worst_b_idx] = best_a
 
-            self.jaya_update()
-            self.tabu_search()
+        if scored_b:
+            best_b = max(scored_b, key=lambda x: x.score)
+            # Replace worst in A
+            if self.pop_a:
+                worst_a_idx = min(range(len(self.pop_a)), key=lambda i: self.pop_a[i].score)
+                if best_b.score > self.pop_a[worst_a_idx].score:
+                    self.pop_a[worst_a_idx] = best_b
 
-            if (it + 1) % T_EXCHANGE == 0:
-                self.exchange()
+    def get_top_molecules(self, n: int) -> List[Individual]:
+        """Return top n unique molecules across both populations."""
+        all_inds = self.pop_a + self.pop_b
+        scored = [ind for ind in all_inds if ind.valid and ind.score > float('-inf')]
 
-            # Update global best
-            all_mols = self.pop_a + self.pop_b
-            if all_mols:
-                top = max(all_mols, key=lambda x: x["score"])
-                if top["score"] > self.best_score:
-                    self.best_score = top["score"]
-                    self.best_smi = top["smiles"]
-                    self.stall = 0
-                    self.mutation_prob = 0.1
-                    log(f"  [{it}] NEW BEST: {self.best_score:.4f} — {self.best_smi[:50]}")
-                else:
-                    self.stall += 1
-                    if self.stall >= STALL_THRESHOLD:
-                        self.mutation_prob = min(0.5, self.mutation_prob * 1.5)
+        # Deduplicate by name
+        seen = set()
+        unique = []
+        for ind in sorted(scored, key=lambda x: x.score, reverse=True):
+            if ind.name not in seen:
+                seen.add(ind.name)
+                unique.append(ind)
 
-            if it % 20 == 0:
-                log(
-                    f"  [{it}] best={self.best_score:.4f} scored={len(self.all_scored)} "
-                    f"stall={self.stall} mut={self.mutation_prob:.2f}"
-                )
+        return unique[:n]
 
-        log(
-            f"DPEX_DJA done: {len(self.all_scored)} scored, best={self.best_score:.4f}"
-        )
-        return sorted(self.all_scored.items(), key=lambda x: -x[1])
+    def update_best(self):
+        """Track the best-ever individual and stall counter."""
+        all_scored = [ind for ind in (self.pop_a + self.pop_b) if ind.score > float('-inf')]
+        if not all_scored:
+            return
 
-
-# ══════════════════════════════════════════════════════════════
-# OUTPUT
-# ══════════════════════════════════════════════════════════════
-def write_output(results, max_mols=100):
-    """Write result.json — BEST MOLECULE MUST BE FIRST."""
-    os.makedirs("/output", exist_ok=True)
-    seen = set()
-    output = []
-    for smi, score in results:
-        if smi not in seen:
-            seen.add(smi)
-            output.append({
-                "product_smiles": smi,
-                "product_name": f"v4_dpex_{score:.4f}",
-                "_score": score,
-            })
-        if len(output) >= max_mols:
-            break
-
-    with open("/output/result.json", "w") as f:
-        json.dump(output, f, indent=2)
-
-    log(f"Output: {len(output)} molecules to /output/result.json")
-    if output:
-        log(f"  #1 (Boltz target): {output[0]['product_smiles'][:60]}  score={output[0]['_score']:.4f}")
+        current_best = max(all_scored, key=lambda x: x.score)
+        if self.best_ever is None or current_best.score > self.best_ever.score:
+            self.best_ever = current_best
+            self.stall_count = 0
+            bt.logging.info(f"New best: {current_best.name} score={current_best.score:.4f}")
+        else:
+            self.stall_count += 1
 
 
-# ══════════════════════════════════════════════════════════════
-# MAIN
-# ══════════════════════════════════════════════════════════════
+# ===========================================================================
+# Main
+# ===========================================================================
+def load_config() -> dict:
+    """Load challenge configuration from input.json."""
+    with open(INPUT_PATH, "r") as f:
+        d = json.load(f)
+    config = {**d.get("config", {}), **d.get("challenge", {})}
+    bt.logging.info(f"Config loaded: targets={len(config.get('target_sequences', []))}, "
+                    f"antitargets={len(config.get('antitarget_sequences', []))}, "
+                    f"num_molecules={config.get('num_molecules', 100)}, "
+                    f"allowed_reaction={config.get('allowed_reaction', 'unknown')}")
+    return config
+
+
+def write_output(molecules: List[str]):
+    """Write result.json in the required format."""
+    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+    result = {"molecules": molecules}
+    with open(OUTPUT_PATH, "w") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    bt.logging.info(f"Wrote {len(molecules)} molecules to {OUTPUT_PATH}")
+
+
 def main():
-    t0 = time.time()
-    log("=" * 60)
-    log("SN68 Blueprint Miner v4 — DPEX_DJA")
-    log("=" * 60)
+    start_time = time.time()
+    bt.logging.info("=" * 60)
+    bt.logging.info("DPEX_DJA Blueprint Miner v2 — starting")
+    bt.logging.info("=" * 60)
 
-    # ── Phase 0: Environment audit ──
-    log("Phase 0: Auditing Docker environment...")
-    diag = audit_environment()
+    # 1. Load config
+    config = load_config()
+    time_budget = config.get("time_budget_sec", 900)
+    num_molecules = config.get("num_molecules", 100)
+    allowed_reaction = config.get("allowed_reaction", "rxn:0")
+    rxn_id = int(allowed_reaction.split(":")[-1])
 
-    # ── Parse input ──
-    inp = diag.get("input_json") or {}
-    target = inp.get("target", inp.get("target_protein", "P23977"))
-    antitargets = inp.get(
-        "antitargets",
-        inp.get("anti_targets", ["G3W658", "A0A8B7SKN4", "Q83ER5", "P83267", "A0A9W3GGF2"]),
-    )
-    log(f"Target: {target}")
-    log(f"Antitargets: {antitargets}")
+    deadline = start_time + time_budget - TIME_RESERVE_SEC
 
-    # ── Find SAVI database ──
-    db = None
-    db_paths = list(diag.get("savi_db_candidates", []))
-    # Check input.json for explicit db path
-    for key in ["savi_db", "database", "db_path", "savi_path", "db"]:
-        if key in inp:
-            db_paths.insert(0, str(inp[key]))
-    # Also check common paths
-    for guess in [
-        "/workspace/savi.db",
-        "/workspace/savi2020.db",
-        "/workspace/data/savi.db",
-        "/workspace/database.db",
-        "/data/savi.db",
-    ]:
-        if os.path.isfile(guess) and guess not in db_paths:
-            db_paths.append(guess)
+    # 2. Find and connect to SAVI database
+    db_path = _find_db()
+    bt.logging.info(f"Database: {db_path}")
+    db = SAVIDatabase(db_path)
 
-    for dbp in db_paths:
-        try:
-            db = SAVIDatabase(dbp, diag.get("db_schemas", {}).get(dbp))
-            log(f"Connected to SAVI: {dbp}")
+    # 3. Initialize optimizer
+    optimizer = DPEX_DJA(db, config, rxn_id)
+    optimizer.initialize_populations()
+
+    # 4. Main optimization loop
+    iteration = 0
+    while time.time() < deadline:
+        iteration += 1
+        elapsed = time.time() - start_time
+        remaining = deadline - time.time()
+        bt.logging.info(f"\n--- Iteration {iteration} | elapsed={elapsed:.0f}s | remaining={remaining:.0f}s ---")
+
+        # Score both populations
+        bt.logging.info("Scoring Pop A...")
+        optimizer.pop_a = optimizer.score_population(optimizer.pop_a, config)
+        if time.time() >= deadline:
             break
-        except Exception as e:
-            log(f"DB {dbp} failed: {e}")
 
-    # ── Initialize scorer ──
-    scorer = Scorer(diag)
-    log(f"Scorer: PSICHIC={'YES' if scorer.psichic_available else 'NO'} "
-        f"RDKit={'YES' if scorer.rdkit_available else 'NO'}")
+        bt.logging.info("Scoring Pop B...")
+        optimizer.pop_b = optimizer.score_population(optimizer.pop_b, config)
+        if time.time() >= deadline:
+            break
 
-    # ── Phase 1+2: DPEX_DJA optimization ──
-    if db:
-        log("Phase 1: Initializing DPEX_DJA...")
-        opt = DPEX_DJA(db, scorer, target, antitargets)
-        opt.initialize()
+        # Update best tracker
+        optimizer.update_best()
 
-        remaining = MAX_TIME_SECONDS - elapsed_since(t0)
-        log(f"Phase 2: Running optimization ({remaining:.0f}s budget)...")
-        results = opt.run(max_time=remaining)
-        write_output(results)
+        # Write current best to output (continuously updated)
+        top = optimizer.get_top_molecules(num_molecules)
+        if top:
+            write_output([ind.name for ind in top])
+            avg_score = sum(ind.score for ind in top) / len(top)
+            bt.logging.info(f"Top {len(top)} avg={avg_score:.4f}, best={top[0].score:.4f}")
 
-        # Log component ranker top picks for intelligence
-        top_comps = opt.ranker.top_n(20)
-        if top_comps:
-            log(f"Top components: {top_comps[:5]}")
+        # Evolve populations
+        bt.logging.info("Evolving Pop A (Jaya)...")
+        optimizer.pop_a = optimizer.evolve_pop_a()
+
+        bt.logging.info("Evolving Pop B (Neighbourhood)...")
+        optimizer.pop_b = optimizer.evolve_pop_b()
+
+        # Population exchange
+        if iteration % EXCHANGE_INTERVAL == 0:
+            bt.logging.info("Exchanging populations...")
+            optimizer.exchange_populations()
+
+        # Check time
+        if time.time() >= deadline:
+            break
+
+    # 5. Final output
+    top = optimizer.get_top_molecules(num_molecules)
+    if top:
+        write_output([ind.name for ind in top])
+        bt.logging.info(f"\nFinal: {len(top)} molecules, best={top[0].score:.4f}")
     else:
-        # ── Fallback: DAT seeds only ──
-        log("WARNING: No SAVI database found — DAT seed fallback")
-        scores = scorer.score_batch(DAT_SEEDS, target, antitargets)
-        results = sorted(scores.items(), key=lambda x: -x[1])
-        write_output(results)
+        # Fallback: write whatever we have
+        all_valid = [ind for ind in (optimizer.pop_a + optimizer.pop_b) if ind.valid]
+        if all_valid:
+            write_output([ind.name for ind in all_valid[:num_molecules]])
+        else:
+            write_output([])
 
-    elapsed = elapsed_since(t0)
-    log(f"{'=' * 60}")
-    log(f"Complete in {elapsed:.0f}s ({elapsed / 60:.1f} min)")
-    log(f"{'=' * 60}")
+    db.close()
+    elapsed = time.time() - start_time
+    bt.logging.info(f"DPEX_DJA complete in {elapsed:.1f}s")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        bt.logging.error(f"Fatal error: {e}")
+        traceback.print_exc()
+        # Write empty output on fatal error
+        try:
+            write_output([])
+        except Exception:
+            pass
