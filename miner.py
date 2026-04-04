@@ -163,7 +163,14 @@ class SAVIDatabase:
     def _load_reactions(self) -> List[Tuple]:
         cursor = self.conn.cursor()
         cursor.execute("SELECT rxn_id, smarts, roleA, roleB, roleC FROM reactions")
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        result = []
+        for r in rows:
+            try:
+                result.append((int(r[0]), r[1], int(r[2]), int(r[3]), int(r[4]) if r[4] is not None else None))
+            except (ValueError, TypeError):
+                result.append(r)
+        return result
 
     def get_reaction_by_id(self, rxn_id: int) -> Optional[Tuple]:
         for r in self.reactions:
@@ -307,9 +314,9 @@ class DPEX_DJA:
         if not rxn_info:
             raise ValueError(f"Reaction {rxn_id} not found")
         self.smarts = rxn_info[1]
-        self.roleA = rxn_info[2]
-        self.roleB = rxn_info[3]
-        self.roleC = rxn_info[4] if rxn_info[4] and rxn_info[4] != 0 else None
+        self.roleA = int(rxn_info[2])
+        self.roleB = int(rxn_info[3])
+        self.roleC = int(rxn_info[4]) if rxn_info[4] and int(rxn_info[4]) != 0 else None
         self.is_three_component = self.roleC is not None
 
         # Pre-fetch reactant pools
@@ -870,10 +877,23 @@ def main():
     deadline = start_time + time_budget - TIME_RESERVE_SEC
 
     # Determine reaction ID
+    rxn_id = None
     if allowed_reaction and allowed_reaction.startswith("rxn:"):
         rxn_id = int(allowed_reaction.split(":")[1])
-    else:
-        rxn_id = 0  # Default
+
+    # If no valid reaction ID from input, discover from database
+    if rxn_id is None or rxn_id == 0:
+        db_path_temp = find_db()
+        conn_temp = sqlite3.connect(f"file:{db_path_temp}?mode=ro&immutable=1", uri=True)
+        cur_temp = conn_temp.cursor()
+        cur_temp.execute("SELECT rxn_id FROM reactions ORDER BY rxn_id LIMIT 1")
+        row = cur_temp.fetchone()
+        conn_temp.close()
+        if row:
+            rxn_id = row[0]
+            log.info(f"No valid allowed_reaction; defaulting to rxn_id={rxn_id}")
+        else:
+            rxn_id = 1  # Last resort default
 
     log.info(f"Target rxn_id={rxn_id}, budget={time_budget}s, deadline in {deadline - time.time():.0f}s")
 
