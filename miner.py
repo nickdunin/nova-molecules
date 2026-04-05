@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-miner.py — DPEX_DJA Blueprint Miner v5.1 for SN68 Nova
+miner.py — DPEX_DJA Blueprint Miner v6.0 for SN68 Nova
 Dual-Population Discrete Jaya Algorithm with ComponentRanker
-7.5/10 Competitive Build (Feature F Complete)
+8.5/10 Competitive Build
 
-Improvements over v2:
+Features:
   - Correct nova_ph2 imports (actual sandbox API)
   - PSICHIC scoring via PsichicWrapper (GPU-accelerated)
   - Robust scoring fallback chain (PSICHIC → RDKit heuristic → random)
@@ -14,8 +14,11 @@ Improvements over v2:
   - Small molecule bias (target 20-30 heavy atoms for normalization advantage)
   - Anti-plateau with adaptive mutation
   - Cross-reaction awareness from input.json
-  - [v5.1] Pre-computed reactant quality prior (QED + heavy atom preference)
-  - [v5.1] Biased population initialization (70/30 biased/random for Pop A, 100% biased for Pop B)
+  - [F] Pre-computed reactant quality prior (QED + heavy atom preference)
+  - [F] Biased population initialization (70/30 biased/random)
+  - [J] Adaptive time allocation (explore → balanced → exploit phases)
+  - [K] Elite archive with novelty search (Tanimoto distance gating)
+  - [L] Reaction-aware diversification (pool analysis + small-mol bias)
 
 Sandbox environment:
   - Reads /workspace/input.json (config + challenge)
@@ -25,6 +28,7 @@ Sandbox environment:
   - RDKit 2024.9.4, PyTorch 2.7.1, ESM2 pre-cached
 """
 
+from __future__ import annotations
 import os
 os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
 
@@ -77,7 +81,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 HAS_PSICHIC = False
 psichic_wrapper = None
-psichic_failed_permanently = False
+psichic_failed_permanently = False  # Set True after first GPU/init failure
 
 try:
     from nova_ph2.PSICHIC.wrapper import PsichicWrapper
@@ -119,6 +123,19 @@ SCORE_BATCH_SIZE = 50  # Molecules per PSICHIC batch
 IDEAL_MIN_HA = 20
 IDEAL_MAX_HA = 35
 
+# Feature J: Adaptive time allocation phases (fraction of usable budget)
+PHASE_EXPLORE_END = 0.40   # First 40%: broad exploration
+PHASE_BALANCED_END = 0.70  # Next 30%: balanced
+# Final 30%: exploitation
+
+# Feature K: Elite archive
+ELITE_ARCHIVE_SIZE = 200      # Max elite archive members
+NOVELTY_THRESHOLD = 0.3       # Min Tanimoto distance to enter archive
+ELITE_INJECT_RATE = 0.05      # Fraction of pop replaced with archive members each iter
+
+# Feature L: Reaction-aware pool analysis
+SMALL_MOL_SAMPLE_SIZE = 200   # Reactants to sample for size analysis
+
 
 # ===========================================================================
 # ComponentRanker — tracks EMA quality of individual reactants
@@ -132,6 +149,8 @@ class ComponentRanker:
         self.count: Dict[int, int] = {}
 
     def seed_prior(self, mol_id: int, prior_score: float):
+        """Seed a reactant with a pre-computed quality prior.
+        Only sets initial value; subsequent updates via update() will blend in."""
         if mol_id not in self.ema:
             self.ema[mol_id] = prior_score
             self.count[mol_id] = 1
@@ -157,6 +176,82 @@ class ComponentRanker:
 
 
 # ===========================================================================
+# Feature K: Elite Archive — best-ever molecules with novelty gating
+# ===========================================================================
+class EliteArchive:
+    """Maintains a novelty-gated archive of the best molecules ever seen."""
+
+    def __init__(self, max_size: int = ELITE_ARCHIVE_SIZE,
+                 novelty_threshold: float = NOVELTY_THRESHOLD):
+        self.max_size = max_size
+        self.novelty_threshold = novelty_threshold
+        self.members: List[Individual] = []
+        self._fingerprints: List = []  # parallel to members
+
+    def try_add(self, ind: Individual) -> bool:
+        """Add individual if it passes novelty and quality gates.
+        Returns True if added."""
+        if not ind.valid or ind.score <= float('-inf'):
+            return False
+
+        # Novelty gate: must be sufficiently different from all archive members
+        if HAS_RDKIT and ind.fingerprint is not None and self._fingerprints:
+            for fp in self._fingerprints:
+                if fp is not None:
+                    sim = tanimoto_similarity(ind.fingerprint, fp)
+                    if sim > (1.0 - self.novelty_threshold):
+                        # Too similar — only replace if score is much better
+                        idx = self._fingerprints.index(fp)
+                        if ind.score > self.members[idx].score * 1.1:
+                            self.members[idx] = ind
+                            self._fingerprints[idx] = ind.fingerprint
+                            return True
+                        return False
+
+        # Archive not full — add directly
+        if len(self.members) < self.max_size:
+            self.members.append(ind)
+            self._fingerprints.append(ind.fingerprint)
+            return True
+
+        # Archive full — replace worst if new is better
+        worst_idx = min(range(len(self.members)),
+                        key=lambda i: self.members[i].score)
+        if ind.score > self.members[worst_idx].score:
+            self.members[worst_idx] = ind
+            self._fingerprints[worst_idx] = ind.fingerprint
+            return True
+
+        return False
+
+    def get_top(self, n: int) -> List[Individual]:
+        """Return top-n members by score."""
+        return sorted(self.members, key=lambda x: x.score, reverse=True)[:n]
+
+    def get_random_elite(self, n: int) -> List[Individual]:
+        """Return n random archive members for injection into populations."""
+        if not self.members:
+            return []
+        return random.sample(self.members, min(n, len(self.members)))
+
+    @property
+    def size(self) -> int:
+        return len(self.members)
+
+    @property
+    def best_score(self) -> float:
+        if not self.members:
+            return float('-inf')
+        return max(m.score for m in self.members)
+
+    @property
+    def avg_score(self) -> float:
+        if not self.members:
+            return 0.0
+        return sum(m.score for m in self.members) / len(self.members)
+
+
+# ===========================================================================
 # SAVI Database Interface
 # ===========================================================================
 class SAVIDatabase:
@@ -172,17 +267,19 @@ class SAVIDatabase:
         cursor = self.conn.cursor()
         cursor.execute("SELECT rxn_id, smarts, roleA, roleB, roleC FROM reactions")
         rows = cursor.fetchall()
+        # Normalize types — rxn_id/roles may come back as str from some SQLite schemas
         result = []
         for r in rows:
             try:
-                result.append((int(r[0]), r[1], int(r[2]), int(r[3]), int(r[4]) if r[4] is not None else None))
+                result.append((int(r[0]), r[1], int(r[2]), int(r[3]),
+                               int(r[4]) if r[4] is not None else None))
             except (ValueError, TypeError):
                 result.append(r)
         return result
 
     def get_reaction_by_id(self, rxn_id: int) -> Optional[Tuple]:
         for r in self.reactions:
-            if r[0] == rxn_id:
+            if int(r[0]) == rxn_id:
                 return r
         return None
 
@@ -351,8 +448,18 @@ class DPEX_DJA:
         # Tabu set
         self.tabu_set: Set[tuple] = set()
 
+        # Feature K: Elite archive
+        self.elite_archive = EliteArchive()
+
+        # Feature J: Phase tracking
+        self.current_phase = "explore"  # explore, balanced, exploit
+
+        # Feature L: Reaction-aware pool preferences
+        self.small_mol_reactants_A: List[int] = []
+        self.small_mol_reactants_B: List[int] = []
+
         log.info(
-            f"DPEX_DJA v5: rxn={rxn_id}, "
+            f"DPEX_DJA v6: rxn={rxn_id}, "
             f"poolA={len(self.pool_A)}, poolB={len(self.pool_B_react)}, "
             f"poolC={len(self.pool_C)}, 3-comp={self.is_three_component}"
         )
@@ -360,49 +467,237 @@ class DPEX_DJA:
         # Feature F: Pre-compute reactant quality priors
         self._compute_reactant_prior()
 
+        # Feature L: Analyze pools for small-molecule bias
+        self._analyze_reaction_pools()
+
+    # ------------------------------------------------------------------
+    # Feature F: Pre-Computed Reactant Quality Prior
+    # ------------------------------------------------------------------
     def _compute_reactant_prior(self):
+        """Score every reactant with RDKit druglikeness proxy and seed
+        the ComponentRanker so biased selection is smart from iteration 0.
+
+        Uses QED (Quantitative Estimate of Druglikeness) when available,
+        falling back to a Lipinski-inspired heuristic.  Also applies a
+        heavy-atom preference bonus (20-30 HA sweet spot for the
+        normalization advantage the validator uses).
+        """
         if not HAS_RDKIT:
-            log.info("No RDKit - skipping reactant quality prior")
+            log.info("No RDKit — skipping reactant quality prior")
             return
+
+        # Try importing QED
         try:
             from rdkit.Chem import QED as QED_module
             has_qed = True
         except ImportError:
             has_qed = False
+
         scored = 0
-        all_pools = [("A", self.pool_A), ("B", self.pool_B_react)]
+        all_pools = [
+            ("A", self.pool_A),
+            ("B", self.pool_B_react),
+        ]
         if self.is_three_component:
             all_pools.append(("C", self.pool_C))
+
         for pool_name, pool in all_pools:
             for mol_id, smiles, role_mask in pool:
                 try:
                     mol = Chem.MolFromSmiles(smiles)
                     if mol is None:
                         continue
+
                     ha = mol.GetNumHeavyAtoms()
+
+                    # Base quality score
                     if has_qed:
-                        base = QED_module.qed(mol) * 3.0
+                        qed_score = QED_module.qed(mol)  # 0-1 range
+                        base = qed_score * 3.0  # Scale to ~0-3
                     else:
+                        # Lipinski heuristic fallback
                         mw = Descriptors.MolWt(mol)
                         logp = Descriptors.MolLogP(mol)
                         hbd = Descriptors.NumHDonors(mol)
                         hba = Descriptors.NumHAcceptors(mol)
                         base = 0.0
-                        if mw < 500: base += 0.8
-                        if logp < 5: base += 0.8
-                        if hbd <= 5: base += 0.4
-                        if hba <= 10: base += 0.4
-                        if Descriptors.RingCount(mol) >= 1: base += 0.3
+                        if mw < 500:
+                            base += 0.8
+                        if logp < 5:
+                            base += 0.8
+                        if hbd <= 5:
+                            base += 0.4
+                        if hba <= 10:
+                            base += 0.4
+                        # Ring count — drug molecules usually have rings
+                        if Descriptors.RingCount(mol) >= 1:
+                            base += 0.3
+
+                    # Heavy-atom preference bonus (normalization advantage)
+                    # Validator divides affinity by heavy atoms, so smaller
+                    # molecules with decent affinity score higher
                     ha_bonus = 0.0
-                    if 20 <= ha <= 25: ha_bonus = 0.5
-                    elif 25 < ha <= 30: ha_bonus = 0.3
-                    elif 30 < ha <= 35: ha_bonus = 0.1
-                    self.ranker.seed_prior(mol_id, base + ha_bonus)
+                    if 20 <= ha <= 25:
+                        ha_bonus = 0.5  # Sweet spot
+                    elif 25 < ha <= 30:
+                        ha_bonus = 0.3
+                    elif 30 < ha <= 35:
+                        ha_bonus = 0.1
+
+                    prior = base + ha_bonus
+                    self.ranker.seed_prior(mol_id, prior)
                     scored += 1
                 except Exception:
                     continue
-        qstr = "yes" if has_qed else "no"
-        log.info(f"Reactant quality prior: scored {scored} reactants (QED={qstr})")
+
+        log.info(f"Reactant quality prior: scored {scored} reactants "
+                 f"(QED={'yes' if has_qed else 'no'})")
+
+    # ------------------------------------------------------------------
+    # Feature L: Reaction-Aware Pool Analysis
+    # ------------------------------------------------------------------
+    def _analyze_reaction_pools(self):
+        """Identify reactants that tend to produce smaller molecules.
+        Smaller products score higher under heavy-atom normalization."""
+        if not HAS_RDKIT:
+            return
+
+        t0 = time.time()
+        # Sample reactants and measure heavy atom counts
+        ha_by_mol: Dict[int, List[int]] = defaultdict(list)
+
+        sample_A = random.sample(self.pool_A, min(SMALL_MOL_SAMPLE_SIZE, len(self.pool_A)))
+        sample_B = random.sample(self.pool_B_react, min(SMALL_MOL_SAMPLE_SIZE, len(self.pool_B_react)))
+
+        for molA in sample_A:
+            try:
+                mol = Chem.MolFromSmiles(molA[1])
+                if mol:
+                    ha_by_mol[molA[0]].append(mol.GetNumHeavyAtoms())
+            except Exception:
+                pass
+
+        for molB in sample_B:
+            try:
+                mol = Chem.MolFromSmiles(molB[1])
+                if mol:
+                    ha_by_mol[molB[0]].append(mol.GetNumHeavyAtoms())
+            except Exception:
+                pass
+
+        # Identify small-molecule reactants (HA < 18 = likely to form 20-30 HA products)
+        for mol_id, ha_list in ha_by_mol.items():
+            avg_ha = sum(ha_list) / len(ha_list)
+            if avg_ha <= 18:
+                if mol_id in self.idx_A:
+                    self.small_mol_reactants_A.append(mol_id)
+                elif mol_id in self.idx_B:
+                    self.small_mol_reactants_B.append(mol_id)
+
+        elapsed = time.time() - t0
+        log.info(f"Reaction pool analysis: {len(self.small_mol_reactants_A)} small-A, "
+                 f"{len(self.small_mol_reactants_B)} small-B ({elapsed:.1f}s)")
+
+    def _small_mol_individual(self) -> Individual:
+        """Generate individual biased toward small-molecule reactants (Feature L)."""
+        for _ in range(20):
+            # Use small-mol reactants if available, else fall back to biased
+            if self.small_mol_reactants_A:
+                mol_id_A = random.choice(self.small_mol_reactants_A)
+                molA = self.idx_A.get(mol_id_A)
+            else:
+                molA = self._biased_select(self.pool_A)
+
+            if self.small_mol_reactants_B:
+                mol_id_B = random.choice(self.small_mol_reactants_B)
+                molB = self.idx_B.get(mol_id_B)
+            else:
+                molB = self._biased_select(self.pool_B_react)
+
+            molC = self._biased_select(self.pool_C) if self.is_three_component else None
+
+            if molA and molB:
+                ind = self._make_individual(molA, molB, molC)
+                if ind.valid and ind.heavy_atoms <= 30:
+                    return ind
+        return self._biased_individual()
+
+    # ------------------------------------------------------------------
+    # Feature J: Update phase based on elapsed time
+    # ------------------------------------------------------------------
+    def update_phase(self, elapsed_fraction: float):
+        """Update optimization phase based on time elapsed."""
+        old_phase = self.current_phase
+        if elapsed_fraction < PHASE_EXPLORE_END:
+            self.current_phase = "explore"
+        elif elapsed_fraction < PHASE_BALANCED_END:
+            self.current_phase = "balanced"
+        else:
+            self.current_phase = "exploit"
+
+        if self.current_phase != old_phase:
+            log.info(f"PHASE SHIFT: {old_phase} → {self.current_phase} "
+                     f"(elapsed={elapsed_fraction:.0%})")
+
+    def get_phase_params(self) -> dict:
+        """Return population sizes and mutation rates for current phase."""
+        if self.current_phase == "explore":
+            return {
+                "pop_a_target": POP_A_SIZE,
+                "pop_b_target": POP_B_SIZE,
+                "mutation_base": 0.20,      # Higher base mutation
+                "exchange_interval": 3,      # Less frequent exchange
+                "small_mol_fraction": 0.15,  # Some small-mol injection
+            }
+        elif self.current_phase == "balanced":
+            return {
+                "pop_a_target": int(POP_A_SIZE * 0.8),
+                "pop_b_target": int(POP_B_SIZE * 1.3),
+                "mutation_base": 0.10,
+                "exchange_interval": 2,
+                "small_mol_fraction": 0.20,
+            }
+        else:  # exploit
+            return {
+                "pop_a_target": int(POP_A_SIZE * 0.5),
+                "pop_b_target": int(POP_B_SIZE * 2.0),
+                "mutation_base": 0.05,       # Low mutation — refine
+                "exchange_interval": 1,      # Very frequent exchange
+                "small_mol_fraction": 0.30,  # Heavy small-mol bias
+            }
+
+    # ------------------------------------------------------------------
+    # Feature K: Archive injection
+    # ------------------------------------------------------------------
+    def inject_elites(self):
+        """Inject elite archive members into populations to prevent drift."""
+        if self.elite_archive.size == 0:
+            return
+
+        n_inject_a = max(1, int(len(self.pop_a) * ELITE_INJECT_RATE))
+        n_inject_b = max(1, int(len(self.pop_b) * ELITE_INJECT_RATE))
+
+        elites_a = self.elite_archive.get_random_elite(n_inject_a)
+        elites_b = self.elite_archive.get_random_elite(n_inject_b)
+
+        # Replace worst members in each population
+        if elites_a and self.pop_a:
+            scored_a = [(i, ind.score) for i, ind in enumerate(self.pop_a)]
+            scored_a.sort(key=lambda x: x[1])
+            for j, elite in enumerate(elites_a):
+                if j < len(scored_a):
+                    idx = scored_a[j][0]
+                    if elite.score > self.pop_a[idx].score:
+                        self.pop_a[idx] = elite
+
+        if elites_b and self.pop_b:
+            scored_b = [(i, ind.score) for i, ind in enumerate(self.pop_b)]
+            scored_b.sort(key=lambda x: x[1])
+            for j, elite in enumerate(elites_b):
+                if j < len(scored_b):
+                    idx = scored_b[j][0]
+                    if elite.score > self.pop_b[idx].score:
+                        self.pop_b[idx] = elite
 
     def _make_individual(self, molA: Tuple, molB: Tuple,
                          molC: Optional[Tuple] = None) -> Individual:
@@ -495,7 +790,7 @@ class DPEX_DJA:
         self.pop_a = []
         self.pop_b = []
 
-        # Build Pop A - 70% biased (use reactant prior), 30% random (diversity)
+        # Build Pop A — 70% biased (use reactant prior), 30% random (diversity)
         n_biased_a = int(n_a * 0.7)
         for _ in range(n_biased_a * 2):
             if len(self.pop_a) >= n_biased_a:
@@ -510,7 +805,7 @@ class DPEX_DJA:
             if ind.valid:
                 self.pop_a.append(ind)
 
-        # Build Pop B - 100% biased (exploitation from best reactants)
+        # Build Pop B — 100% biased (exploitation from best reactants)
         for _ in range(n_b * 3):
             if len(self.pop_b) >= n_b:
                 break
@@ -591,8 +886,9 @@ class DPEX_DJA:
                             target_seq: str, antitarget_seqs: List[str],
                             antitarget_weight: float) -> List[Individual]:
         """Score molecules using PSICHIC wrapper."""
-        global psichic_wrapper, psichic_failed_permanently
+        global psichic_wrapper, psichic_failed_permanently, HAS_PSICHIC
 
+        # Skip PSICHIC entirely if it failed before (e.g. no GPU)
         if psichic_failed_permanently:
             return self._fallback_score(individuals)
 
@@ -662,8 +958,10 @@ class DPEX_DJA:
         except Exception as e:
             log.error(f"PSICHIC scoring failed: {e}")
             traceback.print_exc()
+            # Disable PSICHIC permanently to avoid wasting time retrying
             psichic_failed_permanently = True
-            log.warning("PSICHIC disabled for remainder of run")
+            HAS_PSICHIC = False
+            log.warning("PSICHIC disabled for remainder of run — using RDKit heuristic fallback")
             return self._fallback_score(individuals)
 
     def _fallback_score(self, individuals: List[Individual]) -> List[Individual]:
@@ -701,7 +999,7 @@ class DPEX_DJA:
         return individuals
 
     def evolve_pop_a(self) -> List[Individual]:
-        """Jaya update on Population A."""
+        """Jaya update on Population A with phase-aware mutation."""
         if not self.pop_a:
             return []
 
@@ -712,12 +1010,20 @@ class DPEX_DJA:
         best = max(scored, key=lambda x: x.score)
         worst = min(scored, key=lambda x: x.score)
 
-        # Adaptive mutation rate
-        mutation_boost = min(0.8, 0.15 + 0.15 * self.stall_count) if self.stall_count >= STALL_THRESHOLD else 0.0
+        # Phase-aware mutation rate (Feature J)
+        phase_params = self.get_phase_params()
+        base_mutation = phase_params["mutation_base"]
+        stall_boost = min(0.6, 0.15 * self.stall_count) if self.stall_count >= STALL_THRESHOLD else 0.0
+        mutation_rate = min(0.8, base_mutation + stall_boost)
+        small_mol_rate = phase_params["small_mol_fraction"]
 
         new_pop = []
         for ind in self.pop_a:
-            if random.random() < mutation_boost:
+            r = random.random()
+            if r < small_mol_rate:
+                # Feature L: Small molecule injection
+                candidate = self._small_mol_individual()
+            elif r < small_mol_rate + mutation_rate:
                 candidate = self._biased_individual()
             else:
                 candidate = self._jaya_mutate(ind, best, worst)
@@ -725,10 +1031,24 @@ class DPEX_DJA:
                 new_pop.append(candidate)
             else:
                 new_pop.append(ind)
+
+        # Feature J: Resize population toward phase target
+        target_size = phase_params["pop_a_target"]
+        if len(new_pop) > target_size:
+            # Keep the best, drop worst
+            new_pop.sort(key=lambda x: x.score, reverse=True)
+            new_pop = new_pop[:target_size]
+        elif len(new_pop) < target_size:
+            # Fill with biased individuals
+            while len(new_pop) < target_size:
+                ind = self._biased_individual()
+                if ind.valid:
+                    new_pop.append(ind)
+
         return new_pop
 
     def evolve_pop_b(self) -> List[Individual]:
-        """Tabu neighbourhood search on Population B."""
+        """Tabu neighbourhood search on Population B with phase-aware sizing."""
         new_pop = []
         for ind in self.pop_b:
             candidate = self._neighbourhood_search(ind)
@@ -736,6 +1056,19 @@ class DPEX_DJA:
                 new_pop.append(candidate)
             else:
                 new_pop.append(ind)
+
+        # Feature J: Resize Pop B toward phase target
+        phase_params = self.get_phase_params()
+        target_size = phase_params["pop_b_target"]
+        if len(new_pop) > target_size:
+            new_pop.sort(key=lambda x: x.score, reverse=True)
+            new_pop = new_pop[:target_size]
+        elif len(new_pop) < target_size:
+            while len(new_pop) < target_size:
+                ind = self._biased_individual()
+                if ind.valid:
+                    new_pop.append(ind)
+
         return new_pop
 
     def exchange_populations(self):
@@ -766,7 +1099,7 @@ class DPEX_DJA:
                         self.pop_a[worst_idx] = elite
 
     def update_best(self):
-        """Track best-ever and stall counter."""
+        """Track best-ever, stall counter, and feed elite archive (Feature K)."""
         all_scored = [ind for ind in (self.pop_a + self.pop_b) if ind.score > float('-inf')]
         if not all_scored:
             return
@@ -779,13 +1112,24 @@ class DPEX_DJA:
         else:
             self.stall_count += 1
 
+        # Feature K: Feed elite archive with top molecules from this iteration
+        added = 0
+        for ind in sorted(all_scored, key=lambda x: x.score, reverse=True)[:50]:
+            if self.elite_archive.try_add(ind):
+                added += 1
+        if added > 0:
+            log.info(f"Elite archive: +{added} (total={self.elite_archive.size}, "
+                     f"best={self.elite_archive.best_score:.4f})")
+
     def get_diverse_top_molecules(self, n: int) -> List[Individual]:
         """
         Multi-objective greedy selection:
         Maximize score while maintaining diversity (Tanimoto distance).
         This feeds the entropy bonus in the validator.
+        Includes elite archive members (Feature K).
         """
-        all_inds = self.pop_a + self.pop_b
+        # Merge populations + elite archive for final selection
+        all_inds = self.pop_a + self.pop_b + self.elite_archive.members
         scored = [ind for ind in all_inds if ind.valid and ind.score > float('-inf')]
 
         if not scored:
@@ -914,7 +1258,7 @@ def write_output(molecules: List[str]):
 def main():
     start_time = time.time()
     log.info("=" * 60)
-    log.info("DPEX_DJA Blueprint Miner v5 — starting")
+    log.info("DPEX_DJA Blueprint Miner v6.0 — starting")
     log.info("=" * 60)
 
     # Environment diagnostic
@@ -977,12 +1321,22 @@ def main():
     # 4. Main optimization loop
     iteration = 0
     target_seq = target_seqs[0] if target_seqs else ""
+    usable_budget = deadline - start_time  # Total usable time (budget - reserve)
 
     while time.time() < deadline:
         iteration += 1
         elapsed = time.time() - start_time
         remaining = deadline - time.time()
-        log.info(f"\n--- Iteration {iteration} | elapsed={elapsed:.0f}s | remaining={remaining:.0f}s ---")
+        elapsed_fraction = elapsed / usable_budget if usable_budget > 0 else 1.0
+
+        # Feature J: Update optimization phase
+        optimizer.update_phase(elapsed_fraction)
+        phase_params = optimizer.get_phase_params()
+
+        log.info(f"\n--- Iteration {iteration} | phase={optimizer.current_phase} | "
+                 f"elapsed={elapsed:.0f}s | remaining={remaining:.0f}s | "
+                 f"popA={len(optimizer.pop_a)} popB={len(optimizer.pop_b)} "
+                 f"elite={optimizer.elite_archive.size} ---")
 
         # Score populations
         if HAS_PSICHIC and target_seq and not psichic_failed_permanently:
@@ -1012,8 +1366,12 @@ def main():
         if time.time() >= deadline:
             break
 
-        # Update best tracker
+        # Update best tracker + elite archive (Feature K)
         optimizer.update_best()
+
+        # Feature K: Inject elite archive members into populations
+        if iteration > 1 and optimizer.elite_archive.size > 0:
+            optimizer.inject_elites()
 
         # Write current best to output (continuously updated)
         top = optimizer.get_diverse_top_molecules(num_molecules)
@@ -1024,22 +1382,23 @@ def main():
                 avg_score = sum(ind.score for ind in scored_top) / len(scored_top)
                 log.info(f"Top {len(top)} avg={avg_score:.4f}, best={scored_top[0].score:.4f}")
 
-        # Evolve populations
-        log.info("Evolving Pop A (Jaya)...")
+        # Evolve populations (phase-aware — Feature J)
+        log.info(f"Evolving Pop A (Jaya, {optimizer.current_phase})...")
         optimizer.pop_a = optimizer.evolve_pop_a()
 
-        log.info("Evolving Pop B (Neighbourhood)...")
+        log.info(f"Evolving Pop B (Neighbourhood, {optimizer.current_phase})...")
         optimizer.pop_b = optimizer.evolve_pop_b()
 
-        # Population exchange
-        if iteration % EXCHANGE_INTERVAL == 0:
+        # Population exchange (phase-aware interval)
+        exchange_interval = phase_params["exchange_interval"]
+        if iteration % exchange_interval == 0:
             log.info("Exchanging populations...")
             optimizer.exchange_populations()
 
         if time.time() >= deadline:
             break
 
-    # 5. Final output
+    # 5. Final output (includes elite archive members — Feature K)
     top = optimizer.get_diverse_top_molecules(num_molecules)
     if top:
         write_output([ind.name for ind in top])
@@ -1049,8 +1408,9 @@ def main():
         else:
             log.info(f"\nFINAL: {len(top)} molecules (unscored)")
     else:
-        # Last resort: dump all valid molecules
-        all_valid = [ind for ind in (optimizer.pop_a + optimizer.pop_b) if ind.valid]
+        # Last resort: dump all valid molecules (pop + archive)
+        all_valid = [ind for ind in (optimizer.pop_a + optimizer.pop_b +
+                     optimizer.elite_archive.members) if ind.valid]
         if all_valid:
             write_output([ind.name for ind in all_valid[:num_molecules]])
             log.info(f"\nFALLBACK: {min(len(all_valid), num_molecules)} molecules")
@@ -1058,9 +1418,15 @@ def main():
             write_output([])
             log.error("No valid molecules generated!")
 
+    # Summary stats
+    log.info(f"Elite archive: {optimizer.elite_archive.size} members, "
+             f"best={optimizer.elite_archive.best_score:.4f}, "
+             f"avg={optimizer.elite_archive.avg_score:.4f}")
+    log.info(f"Iterations: {iteration}, final phase: {optimizer.current_phase}")
+
     db.close()
     elapsed = time.time() - start_time
-    log.info(f"DPEX_DJA v5.1 complete in {elapsed:.1f}s")
+    log.info(f"DPEX_DJA v6.0 complete in {elapsed:.1f}s")
 
 
 if __name__ == "__main__":
