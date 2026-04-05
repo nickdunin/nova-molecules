@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-miner.py — DPEX_DJA Blueprint Miner v5 for SN68 Nova
+miner.py — DPEX_DJA Blueprint Miner v5.1 for SN68 Nova
 Dual-Population Discrete Jaya Algorithm with ComponentRanker
-7.5/10 Competitive Build
+7.5/10 Competitive Build (Feature F Complete)
 
 Improvements over v2:
   - Correct nova_ph2 imports (actual sandbox API)
@@ -14,6 +14,8 @@ Improvements over v2:
   - Small molecule bias (target 20-30 heavy atoms for normalization advantage)
   - Anti-plateau with adaptive mutation
   - Cross-reaction awareness from input.json
+  - [v5.1] Pre-computed reactant quality prior (QED + heavy atom preference)
+  - [v5.1] Biased population initialization (70/30 biased/random for Pop A, 100% biased for Pop B)
 
 Sandbox environment:
   - Reads /workspace/input.json (config + challenge)
@@ -75,6 +77,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 HAS_PSICHIC = False
 psichic_wrapper = None
+psichic_failed_permanently = False
 
 try:
     from nova_ph2.PSICHIC.wrapper import PsichicWrapper
@@ -127,6 +130,11 @@ class ComponentRanker:
         self.alpha = alpha
         self.ema: Dict[int, float] = {}
         self.count: Dict[int, int] = {}
+
+    def seed_prior(self, mol_id: int, prior_score: float):
+        if mol_id not in self.ema:
+            self.ema[mol_id] = prior_score
+            self.count[mol_id] = 1
 
     def update(self, mol_ids: List[int], score: float):
         for mid in mol_ids:
@@ -349,6 +357,53 @@ class DPEX_DJA:
             f"poolC={len(self.pool_C)}, 3-comp={self.is_three_component}"
         )
 
+        # Feature F: Pre-compute reactant quality priors
+        self._compute_reactant_prior()
+
+    def _compute_reactant_prior(self):
+        if not HAS_RDKIT:
+            log.info("No RDKit - skipping reactant quality prior")
+            return
+        try:
+            from rdkit.Chem import QED as QED_module
+            has_qed = True
+        except ImportError:
+            has_qed = False
+        scored = 0
+        all_pools = [("A", self.pool_A), ("B", self.pool_B_react)]
+        if self.is_three_component:
+            all_pools.append(("C", self.pool_C))
+        for pool_name, pool in all_pools:
+            for mol_id, smiles, role_mask in pool:
+                try:
+                    mol = Chem.MolFromSmiles(smiles)
+                    if mol is None:
+                        continue
+                    ha = mol.GetNumHeavyAtoms()
+                    if has_qed:
+                        base = QED_module.qed(mol) * 3.0
+                    else:
+                        mw = Descriptors.MolWt(mol)
+                        logp = Descriptors.MolLogP(mol)
+                        hbd = Descriptors.NumHDonors(mol)
+                        hba = Descriptors.NumHAcceptors(mol)
+                        base = 0.0
+                        if mw < 500: base += 0.8
+                        if logp < 5: base += 0.8
+                        if hbd <= 5: base += 0.4
+                        if hba <= 10: base += 0.4
+                        if Descriptors.RingCount(mol) >= 1: base += 0.3
+                    ha_bonus = 0.0
+                    if 20 <= ha <= 25: ha_bonus = 0.5
+                    elif 25 < ha <= 30: ha_bonus = 0.3
+                    elif 30 < ha <= 35: ha_bonus = 0.1
+                    self.ranker.seed_prior(mol_id, base + ha_bonus)
+                    scored += 1
+                except Exception:
+                    continue
+        qstr = "yes" if has_qed else "no"
+        log.info(f"Reactant quality prior: scored {scored} reactants (QED={qstr})")
+
     def _make_individual(self, molA: Tuple, molB: Tuple,
                          molC: Optional[Tuple] = None) -> Individual:
         idA, _, _ = molA
@@ -440,19 +495,26 @@ class DPEX_DJA:
         self.pop_a = []
         self.pop_b = []
 
-        # Build Pop A (random)
-        for _ in range(n_a * 2):  # generate extra, keep valid
+        # Build Pop A - 70% biased (use reactant prior), 30% random (diversity)
+        n_biased_a = int(n_a * 0.7)
+        for _ in range(n_biased_a * 2):
+            if len(self.pop_a) >= n_biased_a:
+                break
+            ind = self._biased_individual()
+            if ind.valid:
+                self.pop_a.append(ind)
+        for _ in range((n_a - len(self.pop_a)) * 3):
             if len(self.pop_a) >= n_a:
                 break
             ind = self._random_individual()
             if ind.valid:
                 self.pop_a.append(ind)
 
-        # Build Pop B (random, but try for smaller molecules)
-        for _ in range(n_b * 2):
+        # Build Pop B - 100% biased (exploitation from best reactants)
+        for _ in range(n_b * 3):
             if len(self.pop_b) >= n_b:
                 break
-            ind = self._random_individual()
+            ind = self._biased_individual()
             if ind.valid:
                 self.pop_b.append(ind)
 
@@ -529,7 +591,10 @@ class DPEX_DJA:
                             target_seq: str, antitarget_seqs: List[str],
                             antitarget_weight: float) -> List[Individual]:
         """Score molecules using PSICHIC wrapper."""
-        global psichic_wrapper
+        global psichic_wrapper, psichic_failed_permanently
+
+        if psichic_failed_permanently:
+            return self._fallback_score(individuals)
 
         valid_inds = [ind for ind in individuals if ind.valid and ind.smiles]
         if not valid_inds:
@@ -597,6 +662,8 @@ class DPEX_DJA:
         except Exception as e:
             log.error(f"PSICHIC scoring failed: {e}")
             traceback.print_exc()
+            psichic_failed_permanently = True
+            log.warning("PSICHIC disabled for remainder of run")
             return self._fallback_score(individuals)
 
     def _fallback_score(self, individuals: List[Individual]) -> List[Individual]:
@@ -918,7 +985,7 @@ def main():
         log.info(f"\n--- Iteration {iteration} | elapsed={elapsed:.0f}s | remaining={remaining:.0f}s ---")
 
         # Score populations
-        if HAS_PSICHIC and target_seq:
+        if HAS_PSICHIC and target_seq and not psichic_failed_permanently:
             # Score Pop A in batches
             log.info("Scoring Pop A with PSICHIC...")
             for batch_start in range(0, len(optimizer.pop_a), SCORE_BATCH_SIZE):
@@ -993,7 +1060,7 @@ def main():
 
     db.close()
     elapsed = time.time() - start_time
-    log.info(f"DPEX_DJA v5 complete in {elapsed:.1f}s")
+    log.info(f"DPEX_DJA v5.1 complete in {elapsed:.1f}s")
 
 
 if __name__ == "__main__":
